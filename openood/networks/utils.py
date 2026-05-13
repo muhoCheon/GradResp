@@ -375,10 +375,12 @@ def get_network(network_config):
                                               network_config.checkpoint):
                     if checkpoint is not None:
                         if checkpoint != 'none':
-                            subnet.load_state_dict(torch.load(checkpoint),
+                            subnet.load_state_dict(torch.load(
+                                checkpoint, weights_only=True),
                                                    strict=False)
             elif isinstance(network_config.checkpoint, str):
-                ckpt = torch.load(network_config.checkpoint)
+                ckpt = torch.load(network_config.checkpoint,
+                                  weights_only=True)
                 subnet_ckpts = {k: {} for k in net.keys()}
                 for k, v in ckpt.items():
                     for subnet_name in net.keys():
@@ -396,11 +398,13 @@ def get_network(network_config):
             pass
         else:
             try:
-                net.load_state_dict(torch.load(network_config.checkpoint),
+                net.load_state_dict(torch.load(network_config.checkpoint,
+                                               weights_only=True),
                                     strict=False)
             except RuntimeError:
                 # sometimes fc should not be loaded
-                loaded_pth = torch.load(network_config.checkpoint)
+                loaded_pth = torch.load(network_config.checkpoint,
+                                        weights_only=True)
                 loaded_pth.pop('fc.weight')
                 loaded_pth.pop('fc.bias')
                 net.load_state_dict(loaded_pth, strict=False)

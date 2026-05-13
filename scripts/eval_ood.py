@@ -144,7 +144,9 @@ for subfolder in sorted(glob(os.path.join(root, 's*'))):
         net = eval(args.wrapper_net)(backbone=net)
 
     net.load_state_dict(
-        torch.load(os.path.join(subfolder, 'best.ckpt'), map_location='cpu'))
+        torch.load(os.path.join(subfolder, 'best.ckpt'),
+                   map_location='cpu',
+                   weights_only=True))
     net.cuda()
     net.eval()
 

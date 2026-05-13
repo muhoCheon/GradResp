@@ -34,7 +34,7 @@ class EnsemblePostprocessor(BasePostprocessor):
         self.networks = [deepcopy(net) for i in range(self.num_networks)]
         for i in range(self.num_networks):
             self.networks[i].load_state_dict(torch.load(
-                self.checkpoint_dirs[i]),
+                self.checkpoint_dirs[i], weights_only=True),
                                              strict=False)
             self.networks[i].eval()
 

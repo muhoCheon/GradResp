@@ -6,6 +6,7 @@ _test_*
 data
 data/
 results/
+results_test/
 checkpoints/
 ipynb_checkpoints/
 

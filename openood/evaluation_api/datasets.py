@@ -99,7 +99,12 @@ DATA_INFO = {
             }
         },
         'csid': {
-            'datasets': [],
+            'datasets': ['cifar100c'],
+            'cifar100c': {
+                'data_dir': 'images_classic/',
+                'imglist_path':
+                'benchmark_imglist/cifar100/test_cifar100c.txt'
+            },
         },
         'ood': {
             'val': {
@@ -244,7 +249,7 @@ DATA_INFO = {
         },
         'csid': {
             'datasets':
-            ['imagenet_v2', 'imagenet_c', 'imagenet_r', 'imagenet_es'],
+            ['imagenet_v2', 'imagenet_c', 'imagenet_r'],
             'imagenet_v2': {
                 'data_dir': 'images_largescale/',
                 'imglist_path':
@@ -259,11 +264,6 @@ DATA_INFO = {
                 'data_dir': 'images_largescale/',
                 'imglist_path':
                 'benchmark_imglist/imagenet/test_imagenet_r.txt'
-            },
-            'imagenet_es': {
-                'data_dir': 'images_largescale/',
-                'imglist_path':
-                'benchmark_imglist/imagenet/test_imagenet_es.txt'
             },
         },
         'ood': {
@@ -364,7 +364,7 @@ benchmarks_dict = {
     ],
     'imagenet': [
         'imagenet_1k', 'ssb_hard', 'ninco', 'inaturalist', 'texture',
-        'openimage_o', 'imagenet_v2', 'imagenet_c', 'imagenet_r', 'imagenet_es'
+        'openimage_o', 'imagenet_v2', 'imagenet_c', 'imagenet_r'
     ],
 }
 

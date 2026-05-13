@@ -232,7 +232,8 @@ def get_network(network_config):
                                           network_config.checkpoint):
                 if checkpoint is not None:
                     if checkpoint != 'none':
-                        subnet.load_state_dict(torch.load(checkpoint),
+                        subnet.load_state_dict(torch.load(
+                            checkpoint, weights_only=True),
                                                strict=False)
         elif network_config.name == 'bit' and not network_config.normal_load:
             net.load_from(np.load(network_config.checkpoint))
@@ -240,11 +241,13 @@ def get_network(network_config):
             pass
         else:
             try:
-                net.load_state_dict(torch.load(network_config.checkpoint),
+                net.load_state_dict(torch.load(network_config.checkpoint,
+                                               weights_only=True),
                                     strict=False)
             except RuntimeError:
                 # sometimes fc should not be loaded
-                loaded_pth = torch.load(network_config.checkpoint)
+                loaded_pth = torch.load(network_config.checkpoint,
+                                        weights_only=True)
                 loaded_pth.pop('fc.weight')
                 loaded_pth.pop('fc.bias')
                 net.load_state_dict(loaded_pth, strict=False)

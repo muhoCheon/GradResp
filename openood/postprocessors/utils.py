@@ -3,6 +3,7 @@ from openood.utils import Config
 from .nci_postprocessor import NCIPostprocessor
 from .fdbd_postprocessor import fDBDPostprocessor
 from .ash_postprocessor import ASHPostprocessor
+from .adascale_postprocessor import AdaScalePostprocessor
 from .base_postprocessor import BasePostprocessor
 from .cider_postprocessor import CIDERPostprocessor
 from .conf_branch_postprocessor import ConfBranchPostprocessor
@@ -17,6 +18,7 @@ from .gmm_postprocessor import GMMPostprocessor
 from .godin_postprocessor import GodinPostprocessor
 from .gradnorm_postprocessor import GradNormPostprocessor
 from .gram_postprocessor import GRAMPostprocessor
+from .iodin_postprocessor import IODINPostprocessor
 from .kl_matching_postprocessor import KLMatchingPostprocessor
 from .knn_postprocessor import KNNPostprocessor
 from .maxlogit_postprocessor import MaxLogitPostprocessor
@@ -36,6 +38,7 @@ from .residual_postprocessor import ResidualPostprocessor
 from .rotpred_postprocessor import RotPredPostprocessor
 from .rankfeat_postprocessor import RankFeatPostprocessor
 from .ssd_postprocessor import SSDPostprocessor
+from .scale_postprocessor import ScalePostprocessor
 from .she_postprocessor import SHEPostprocessor
 from .temp_scaling_postprocessor import TemperatureScalingPostprocessor
 from .t2fnorm_postprocessor import T2FNormPostprocessor
@@ -57,6 +60,7 @@ def get_postprocessor(config: Config):
         'msp': BasePostprocessor,
         'ebo': EBOPostprocessor,
         'odin': ODINPostprocessor,
+        'iodin': IODINPostprocessor,
         'mds': MDSPostprocessor,
         'mds_ensemble': MDSEnsemblePostprocessor,
         'rmds': RMDSPostprocessor,
@@ -83,6 +87,9 @@ def get_postprocessor(config: Config):
         'opengan': OpenGanPostprocessor,
         'knn': KNNPostprocessor,
         'dice': DICEPostprocessor,
+        'scale': ScalePostprocessor,
+        'adascale_a': AdaScalePostprocessor,
+        'adascale_l': AdaScalePostprocessor,
         'ssd': SSDPostprocessor,
         'she': SHEPostprocessor,
         'rd4ad': Rd4adPostprocessor,
