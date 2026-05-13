@@ -97,6 +97,16 @@ bash scripts_my/runners/group1_small_medium.sh
 `MNIST`, `CIFAR-10`, `CIFAR-100`에 대해 Group 1 post-hoc method 스크립트를 순서대로 실행한다.
 각 method/dataset 실행 로그와 metadata는 `results_test/runs/<method>/<dataset>/` 아래에 저장된다.
 
+전체 ImageNet 계열 dataset 검증 실행:
+
+```bash
+bash scripts_my/runners/group1_imagenet.sh
+```
+
+`ImageNet`, `ImageNet-200`에 대해 Group 1 post-hoc method 스크립트를 순서대로 실행한다.
+small/medium runner와 동일하게 각 method/dataset 실행 로그와 metadata는 `results_test/runs/<method>/<dataset>/` 아래에 저장된다.
+현재 로컬 ImageNet train split 준비 상태에 따라 train feature 의존 방법 일부는 skip 처리될 수 있으며, 자세한 사유는 아래 `Skip 사유` 섹션을 따른다.
+
 metadata를 기준으로 체크리스트 갱신:
 
 ```bash
