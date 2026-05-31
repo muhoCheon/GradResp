@@ -226,16 +226,13 @@ run_dataset() {
       run_pair 0 msp imagenet scripts_my/ood/msp/imagenet_test_ood_msp.sh 1 mls imagenet scripts_my/ood/mls/imagenet_test_ood_maxlogit.sh
       run_pair 0 ebo imagenet scripts_my/ood/ebo/imagenet_test_ood_ebo.sh 1 odin imagenet scripts_my/ood/odin/imagenet_test_ood_odin.sh
       run_pair 0 iodin imagenet scripts_my/ood/iodin/imagenet_test_ood_iodin.sh 1 gradnorm imagenet scripts_my/ood/gradnorm/imagenet_test_ood_gradnorm.sh
-      mark_skip mds imagenet "skipped because the local ImageNet train imglist references missing files, which breaks MDS train-feature statistics setup"
-      mark_skip rmds imagenet "skipped because the local ImageNet train imglist references missing files, which breaks RMDS train-feature statistics setup"
-      mark_skip knn imagenet "skipped because the local ImageNet train imglist references missing files, which breaks KNN train-feature setup"
-      mark_skip vim imagenet "skipped because the local ImageNet train imglist references missing files, which breaks ViM train-feature setup"
+      run_pair 0 mds imagenet scripts_my/ood/mds/imagenet_test_ood_mds.sh 1 rmds imagenet scripts_my/ood/rmds/imagenet_test_ood_rmds.sh
+      run_pair 0 knn imagenet scripts_my/ood/knn/imagenet_test_ood_knn.sh 1 vim imagenet scripts_my/ood/vim/imagenet_test_ood_vim.sh
       run_pair 0 residual imagenet scripts_my/ood/residual/imagenet_test_ood_residual.sh 1 react imagenet scripts_my/ood/react/imagenet_test_ood_react.sh
       run_pair 0 ash imagenet scripts_my/ood/ash/imagenet_test_ood_ash.sh
-      mark_skip dice imagenet "skipped because the local ImageNet train imglist references missing files, which breaks DICE activation setup"
-      mark_skip gram imagenet "skipped because the local ImageNet train imglist references missing files, which breaks GRAM feature statistics setup"
+      run_pair 0 dice imagenet scripts_my/ood/dice/imagenet_test_ood_dice.sh 1 gram imagenet scripts_my/ood/gram/imagenet_test_ood_gram.sh
       run_pair 1 klm imagenet scripts_my/ood/kl_matching/imagenet_test_ood_kl_matching.sh
-      mark_skip she imagenet "skipped because the local ImageNet train imglist references missing files, which breaks SHE activation setup"
+      run_pair 0 she imagenet scripts_my/ood/she/imagenet_test_ood_she.sh
       run_pair 1 scale imagenet scripts_my/ood/scale/imagenet_test_ood_scale.sh
       mark_skip adascale_a imagenet "skipped because AdaScale requires AdaScaleANet wrapping, which is not applied in the main.py test_ood pipeline"
       mark_skip adascale_l imagenet "skipped because AdaScale requires AdaScaleLNet wrapping, which is not applied in the main.py test_ood pipeline"
@@ -244,17 +241,15 @@ run_dataset() {
       run_pair 0 msp imagenet200 scripts_my/ood/msp/imagenet200_test_ood_msp.sh 1 mls imagenet200 scripts_my/ood/mls/imagenet200_test_ood_maxlogit.sh
       run_pair 0 ebo imagenet200 scripts_my/ood/ebo/imagenet200_test_ood_ebo.sh 1 odin imagenet200 scripts_my/ood/odin/imagenet200_test_ood_odin.sh
       run_pair 0 iodin imagenet200 scripts_my/ood/iodin/imagenet200_test_ood_iodin.sh 1 gradnorm imagenet200 scripts_my/ood/gradnorm/imagenet200_test_ood_gradnorm.sh
-      mark_skip mds imagenet200 "skipped because the local ImageNet-200 train imglist references missing ImageNet train files, which breaks MDS train-feature statistics setup"
-      mark_skip rmds imagenet200 "skipped because the local ImageNet-200 train imglist references missing ImageNet train files, which breaks RMDS train-feature statistics setup"
-      mark_skip knn imagenet200 "skipped because the local ImageNet-200 train imglist references missing ImageNet train files, which breaks KNN train-feature setup"
-      mark_skip vim imagenet200 "skipped because the current ViM dim sweep includes 1000 and the local ImageNet-200 train imglist references missing ImageNet train files"
+      run_pair 0 mds imagenet200 scripts_my/ood/mds/imagenet200_test_ood_mds.sh 1 rmds imagenet200 scripts_my/ood/rmds/imagenet200_test_ood_rmds.sh
+      run_pair 0 knn imagenet200 scripts_my/ood/knn/imagenet200_test_ood_knn.sh
+      mark_skip vim imagenet200 "skipped because the current ViM dim sweep includes 1000, which exceeds ImageNet-200 ResNet18 feature_dim=512"
       mark_skip residual imagenet200 "skipped because the shared Residual dim=512 equals ImageNet-200 ResNet18 feature_dim=512 and produces a degenerate residual subspace"
       run_pair 1 react imagenet200 scripts_my/ood/react/imagenet200_test_ood_react.sh
       run_pair 0 ash imagenet200 scripts_my/ood/ash/imagenet200_test_ood_ash.sh
-      mark_skip dice imagenet200 "skipped because the local ImageNet-200 train imglist references missing ImageNet train files, which breaks DICE activation setup"
-      mark_skip gram imagenet200 "skipped because the local ImageNet-200 train imglist references missing ImageNet train files, which breaks GRAM feature statistics setup"
+      run_pair 0 dice imagenet200 scripts_my/ood/dice/imagenet200_test_ood_dice.sh 1 gram imagenet200 scripts_my/ood/gram/imagenet200_test_ood_gram.sh
       run_pair 1 klm imagenet200 scripts_my/ood/kl_matching/imagenet200_test_ood_kl_matching.sh
-      mark_skip she imagenet200 "skipped because the local ImageNet-200 train imglist references missing ImageNet train files, which breaks SHE activation setup"
+      run_pair 0 she imagenet200 scripts_my/ood/she/imagenet200_test_ood_she.sh
       run_pair 1 scale imagenet200 scripts_my/ood/scale/imagenet200_test_ood_scale.sh
       mark_skip adascale_a imagenet200 "skipped because AdaScale requires AdaScaleANet wrapping, which is not applied in the main.py test_ood pipeline"
       mark_skip adascale_l imagenet200 "skipped because AdaScale requires AdaScaleLNet wrapping, which is not applied in the main.py test_ood pipeline"

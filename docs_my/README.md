@@ -18,3 +18,5 @@
 - [notes/score_convention.md](notes/score_convention.md): OpenOOD score 방향 convention과 예외 가능성
 - [notes/ood_method_groups.md](notes/ood_method_groups.md): post-hoc 방법과 train-dependent 방법 구분, TTA response 방법의 비교군
 - [notes/known_issues.md](notes/known_issues.md): 로컬 재현 중 발견한 코드/설정 이슈
+- [TARR/implementation.md](TARR/implementation.md): TARR four-stage artifact pipeline 설명
+- [TARR/commands.md](TARR/commands.md): TARR stage별 실행 명령어
