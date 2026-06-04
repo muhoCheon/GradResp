@@ -1,5 +1,8 @@
 """Target-only TTA configuration helpers for TARR."""
 
+import hashlib
+import json
+
 OBJECTIVES = [
     'predicted_label_ce',
     'entropy',
@@ -30,27 +33,46 @@ def resolve_tta_update_impl(update_scope):
 
 
 def tta_config_id(args, resolved_runtime_mode):
-    objective = {
-        'predicted_label_ce': 'plce',
-        'entropy': 'ent',
-        'memo_marginal_entropy': 'memo',
-        'view_consistency_kl': 'vckl',
-        'view_consistency_js': 'vcjs',
-        'entropy_consistency': 'hcons',
-    }.get(args.objective, args.objective)
+    if getattr(args, 'tta_mode', 'normal') == 'ar_bank':
+        bank_payload = {
+            'accept': list(getattr(args, 'accept_probe_type_bank', [])),
+            'reject': list(getattr(args, 'reject_probe_type_bank', [])),
+        }
+        digest = hashlib.sha1(
+            json.dumps(bank_payload, sort_keys=True).encode('utf-8')
+        ).hexdigest()[:10]
+        objective = (
+            f'arbank_a{len(bank_payload["accept"])}'
+            f'_r{len(bank_payload["reject"])}_{digest}')
+    else:
+        objective = {
+            'predicted_label_ce': 'plce',
+            'entropy': 'ent',
+            'memo_marginal_entropy': 'memo',
+            'view_consistency_kl': 'vckl',
+            'view_consistency_js': 'vcjs',
+            'entropy_consistency': 'hcons',
+        }.get(args.objective, args.objective)
     lr = f'{args.lr:g}'.replace('.', 'p').replace('-', 'm')
     scope = {'classifier': 'cls', 'all': 'all'}.get(args.update_scope, args.update_scope)
     bn = 'fbn' if args.freeze_bn_stats else 'ubn'
+    response_steps = getattr(args, 'response_steps', [args.steps])
+    if response_steps == [args.steps]:
+        step_tag = f's{args.steps}'
+    else:
+        step_tag = f's{args.steps}_save{"-".join(str(s) for s in response_steps)}'
     config_id = (
-        f'{objective}_s{args.steps}_lr{lr}_{scope}_{resolved_runtime_mode}_{bn}'
+        f'{objective}_{step_tag}_lr{lr}_{scope}_{resolved_runtime_mode}_{bn}'
     )
     return config_id
 
 
 def tta_config_dict(args, resolved_runtime_mode, update_impl):
-    return {
-        'objective': args.objective,
+    config = {
+        'tta_mode': getattr(args, 'tta_mode', 'normal'),
+        'objective': args.objective if getattr(args, 'tta_mode', 'normal') == 'normal' else None,
         'steps': args.steps,
+        'response_steps': list(getattr(args, 'response_steps', [args.steps])),
         'lr': args.lr,
         'update_scope': args.update_scope,
         'runtime_mode_arg': args.runtime_mode,
@@ -59,6 +81,12 @@ def tta_config_dict(args, resolved_runtime_mode, update_impl):
         'optimizer_policy': update_impl,
         'freeze_bn_stats': bool(args.freeze_bn_stats),
     }
+    if getattr(args, 'tta_mode', 'normal') == 'ar_bank':
+        config.update({
+            'accept_probe_types': list(getattr(args, 'accept_probe_type_bank', [])),
+            'reject_probe_types': list(getattr(args, 'reject_probe_type_bank', [])),
+        })
+    return config
 
 
 def _float_token(value):

@@ -1,5 +1,7 @@
 # TARR Soft View-Consistency Objective Plan
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 
 TARR의 다음 active plan은 target augmentation views의 soft prediction distribution을 이용하는 TTA objective를 검증하는 것이다.

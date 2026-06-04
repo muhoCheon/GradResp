@@ -6,13 +6,18 @@ TARR is implemented as a four-stage artifact pipeline:
 train_candidate_metadata -> reference_set -> tta_response -> score_result
 ```
 
+The new Probe/Anchor plan keeps the existing `reference_set` artifact as the
+Probe/Measurement set `P`. A new optional `anchor_set` artifact is the Anchor
+set `A`, stored under `anchor_sets/`, and is used only to regularize target
+updates. Scores are still measured on Probe `P`.
+
 Each stage has a manifest, an identity, and a single canonical output location. Inline scoring and offline scoring both execute Stage 4 and write the same `score_result` layout.
 
 ## Package Layout
 
 ```text
 scripts_my/tarr/
-  reference.py    Stage 1 train_candidate_metadata and Stage 2 reference_set builders
+  reference.py    Stage 1 train_candidate_metadata and Stage 2 reference_set/anchor_set builders
   eval.py         Stage 3 tta_response runner and one-command Stage 1-4 orchestration
   adaptation.py   TTA/runtime/update-policy config helpers
   scoring.py      score_rule definitions that produce score_result values
@@ -25,19 +30,21 @@ scripts_my/tarr/
 ## Execution Flow
 
 1. Stage 1 builds `train_candidate_metadata` from the ID train split. The artifact records candidate labels, model predictions, confidence/entropy/margin/energy diagnostics, correctness, CE loss, dataset indices, and the identity of the train imglist, checkpoint, model, preprocessing, and schema.
-2. Stage 2 builds one or more `reference_set` artifacts from `train_candidate_metadata`. Each `reference_set` records the selected samples, selection hash, per-class counts, base reference response, and reference config.
-3. Stage 3 runs target-only TTA once per target sample and writes `tta_response` for every target dataset/reference pair. It records target pre/post adaptation diagnostics, adapted reference response, response deltas, perturbation diagnostics when configured, and runtime.
-4. Stage 4 applies a score rule to `tta_response` and writes a `score_result`. Metrics, OpenOOD score files, and score manifests live under `score_results/<score_rule>/`.
-5. `reports.py diagnostics` summarizes `tta_response` and `score_result` artifacts, including clean-vs-csID alignment for FSOOD.
+2. Stage 2P builds one or more `reference_set` Probe `P` artifacts from `train_candidate_metadata`. Each `reference_set` records the selected samples, selection hash, per-class counts, base probe response, and reference config.
+3. Stage 2A optionally builds one or more `anchor_set` Anchor `A` artifacts from `train_candidate_metadata`. `A` is ID train data used by the update loss to constrain drift; it must stay disjoint from the paired Probe `P`.
+4. Stage 3 runs target-only TTA once per target sample and writes `tta_response` for every target dataset/reference pair. `--steps` is the maximum update step count. `--save-steps` selects which update-step responses to store, defaulting to the final step only. It records target pre/post adaptation diagnostics, adapted probe response, response deltas, optional anchor config/loss diagnostics, perturbation diagnostics when configured, and runtime.
+5. Stage 4 applies a score rule to `tta_response` and writes a `score_result`. For step-wise responses, `--response-step` selects one saved update step before scoring. Metrics, OpenOOD score files, and score manifests live under `score_results/<score_rule>/`, or `score_results/<score_rule>/step_<k>/` when step-specific output is used.
+6. `reports.py diagnostics` summarizes `tta_response` and `score_result` artifacts, including clean-vs-csID alignment for FSOOD.
 
 ## Stage Identity
 
 | Stage | Identity fields | Rebuild trigger |
 | --- | --- | --- |
 | `train_candidate_metadata` | Dataset, train imglist path/SHA256, checkpoint path/SHA256, model architecture, class count, preprocessing identity, metadata schema | Any identity change. |
-| `reference_set` | Stage 1 identity, reference source, filter, per-class size, confidence threshold, seed, selected-sample hash | Reference config or Stage 1 change. |
-| `tta_response` | Dataset, scheme, baseline protocol, target split, csID identity, checkpoint identity, TTA config, runtime mode, perturbation config, `reference_set_id`, full/subset status, response schema | Protocol, TTA, perturbation, target sampling, checkpoint, or reference_set change. |
-| `score_result` | `tta_response_id`, score rule, score direction, FSOOD ID-side aggregation, scoring schema | Score-rule or scoring aggregation change. |
+| `reference_set` / Probe `P` | Stage 1 identity, reference source, filter, per-class size, confidence threshold, seed, selected-sample hash | Reference config or Stage 1 change. |
+| `anchor_set` / Anchor `A` | Stage 1 identity, anchor source, filter, per-class size, confidence threshold, seed, selected-sample hash, paired Probe exclusion identity | Anchor config, paired Probe exclusion, or Stage 1 change. |
+| `tta_response` | Dataset, scheme, baseline protocol, target split, csID identity, checkpoint identity, TTA config, max `steps`, `response_steps`, runtime mode, perturbation config, `reference_set_id`, optional `anchor_set_id`, full/subset status, response schema | Protocol, TTA, anchor, perturbation, target sampling, checkpoint, or reference_set change. |
+| `score_result` | `tta_response_id`, score rule, selected `response_step`, score direction, FSOOD ID-side aggregation, scoring schema | Score-rule, selected response step, or scoring aggregation change. |
 
 Scoring-only changes start at Stage 4. TTA or protocol changes start at Stage 3. Reference selection changes start at Stage 2. Dataset/checkpoint/preprocessing changes start at Stage 1.
 
@@ -54,6 +61,13 @@ results_test/tarr/
     <dataset>/<reference_config_id>/seed<seed>/<reference_set_id>/
       manifest.json
       reference_set.npz
+      selected_samples.csv
+      preview/  # optional image copies for human inspection
+
+  anchor_sets/
+    <dataset>/<reference_config_id>/seed<seed>/<anchor_set_id>/
+      manifest.json
+      anchor_set.npz
       selected_samples.csv
       preview/  # optional image copies for human inspection
 
@@ -83,8 +97,10 @@ python scripts_my/tarr/eval.py \
   --baseline-protocol eval_api \
   --scheme fsood \
   --reference-config all_rpc16:per_class=16,filter=all,min_confidence=0.9,seed=0 \
+  --tta-mode normal \
   --objective entropy \
   --steps 5 \
+  --save-steps 1,3,5 \
   --lr 1e-2 \
   --update-scope classifier \
   --runtime-mode auto \
@@ -98,6 +114,7 @@ Stage-specific CLIs follow the same artifact boundaries:
 ```bash
 python scripts_my/tarr/reference.py build-train-metadata ...
 python scripts_my/tarr/reference.py build-reference-set ...
+python scripts_my/tarr/reference.py build-anchor-set ...
 python scripts_my/tarr/eval.py run-response --use-prebuilt-reference-set ...
 python scripts_my/tarr/cache.py score ...
 python scripts_my/tarr/reports.py diagnostics ...
@@ -107,19 +124,24 @@ Runnable dataset-specific commands are collected in [commands.md](commands.md).
 
 `eval.py run-response --use-prebuilt-reference-set` is strict Stage 3 mode: it
 loads prebuilt `reference_set` artifacts and fails if any requested reference
-set is missing. `eval.py run-all` is the convenience orchestration mode for
-running the stages together.
+set is missing. It also verifies that the prebuilt Probe `P` was created from
+the current dataset, checkpoint, model, classifier layer, runtime mode, and
+`train_candidate_metadata` identity. When Anchor `A` is enabled, the paired
+`anchor_set` must point to the same `train_candidate_metadata`, the same Probe
+`reference_set_id`, and `anchor_probe_disjoint=true`. `eval.py run-all` is the
+convenience orchestration mode for running the stages together.
 
 ## Option Axes
 
 | Axis | Examples | First affected stage |
 | --- | --- | --- |
 | Dataset/checkpoint/preprocessing | dataset, train imglist, checkpoint SHA256, model arch | Stage 1 |
-| `reference_set` config | per-class size, filter, confidence threshold, seed | Stage 2 |
+| `reference_set` / Probe `P` config | per-class size, filter, confidence threshold, seed | Stage 2P |
+| `anchor_set` / Anchor `A` config | per-class size, filter, confidence threshold, seed, anchor loss weight, paired Probe exclusion | Stage 2A/3 |
 | Protocol config | OOD/FSOOD scheme, baseline protocol, csID identity, target split list | Stage 3 |
-| TTA config | objective, steps, lr, update scope, runtime mode, freeze BN stats | Stage 3 |
+| TTA config | objective, max `steps`, `save_steps` / `response_steps`, lr, update scope, runtime mode, freeze BN stats | Stage 3 |
 | Perturbation/view config | view count, view seed, perturbation kind/epsilon/repeats | Stage 3 |
-| `score_result` config | score rule, FSOOD clean/csID/both ID-side aggregation | Stage 4 |
+| `score_result` config | score rule, selected `response_step`, FSOOD clean/csID/both ID-side aggregation | Stage 4 |
 
 Multiple `reference_set` configs can share the same Stage 3 target TTA work when they are bundled into the same run. Each reference still writes its own `tta_response` and `score_result`.
 
@@ -154,7 +176,7 @@ Soft view-consistency uses multiple deterministic or stochastic views of the sam
 
 ## Reference Set Protocol
 
-`reference_set` artifacts are always selected from ID train data. OOD, csID, and ID test target samples are not eligible for `reference_set` selection.
+`reference_set` Probe `P` artifacts are always selected from ID train data. OOD, csID, and ID test target samples are not eligible for `reference_set` selection.
 
 | Filter | Rule | Purpose |
 | --- | --- | --- |
@@ -179,15 +201,122 @@ order before sampling within each stratum.
 
 ImageNet-scale `reference_set` sizes must be predeclared and reported as resource-adjusted when they materially change runtime.
 
+## Anchor Set Protocol
+
+`anchor_set` Anchor `A` artifacts are also selected from ID train data and use
+the same filter vocabulary as Probe `P` unless an ablation declares otherwise.
+`A` is not a scoring surface. It is added to the target update objective as an
+ID-preserving regularizer, for example:
+
+```text
+L_update = L_target_probe(x) + lambda_anchor * CE(f_theta(A), y_A)
+```
+
+For a paired run, `A` and `P` must be disjoint:
+
+```text
+A = anchor_set
+P = reference_set
+A_intersect_P = empty
+```
+
+The initial ablation should vary Anchor independently from
+Acceptance/Rejection Probe logic:
+
+| Setting | Acceptance/Rejection | Anchor |
+| --- | --- | --- |
+| Baseline TARR | off | off |
+| Anchor only | off | on |
+| Acceptance/Rejection only | on | off |
+| Acceptance/Rejection + Anchor | on | on |
+
+## Step-Wise Response
+
+`--steps` is the maximum number of target-update steps that Stage 3 may run.
+`--save-steps` is a comma-separated list of positive update counts to persist,
+for example `--steps 30 --save-steps 1,5,10,30`. Omitted `--save-steps`
+means save only the final step, equivalent to `response_steps=[steps]`.
+
+`response_steps` is stored in the `tta_response` cache and defines the step
+axis `S`. Fields that are class-wise per target use shape `[N,S,C]`; fields
+that are scalar per target use shape `[N,S]`. Non-adaptation metadata such as
+labels, pretrained prediction, and pretrained target probabilities stays
+sample-wise, usually `[N]` or `[N,C]`.
+
+Normal TARR records the step-wise existing-update response fields, including
+`delta`, `adapted_reference_loss`, target post-TTA diagnostics, and derived
+reference deltas. Acceptance/Rejection TARR additionally records step-wise
+accept/reject fields such as `accept_ref_loss_delta`,
+`reject_ref_loss_delta`, `accept_target_objective_delta`, and
+`reject_target_objective_delta`. `reject_target_entropy_delta` is retained only as a
+diagnostic target-entropy response, not as a canonical A/R efficiency
+numerator.
+
+Stage 4 first selects one saved update count with `--response-step`; all score
+formulas then run on that selected slice. The selected `response_step` is part
+of the `score_result` identity and must be recorded for claim-bearing rows.
+
+## Acceptance/Rejection Response Bank
+
+A/R response-bank mode is enabled by passing plural Stage 3 probe lists:
+
+```bash
+--tta-mode ar_bank \
+--accept-probe-types predicted_label_ce,entropy_min,view_consistency \
+--reject-probe-types entropy_max,uniform
+```
+
+The claim-oriented accept bank is limited to `predicted_label_ce`,
+`entropy_min`, and `view_consistency`. `topk_ce` and `allclass_ce` are excluded
+from documented defaults because they do not match the current semantic A/R
+claim. The semantic reject bank uses `entropy_max` and `uniform`.
+`logit_suppression` is reserved for evidence/energy suppression analysis and
+must not be described as semantic rejection.
+
+In bank mode, Stage 3 runs each branch from `theta_0` and stores branch-aware
+fields in addition to primary singleton fields:
+
+| Field | Shape before Stage 4 step selection | Meaning |
+| --- | --- | --- |
+| `accept_ref_loss_delta_bank` | `[N,S,A,C]` | Reference CE loss deltas for each acceptance branch. |
+| `reject_ref_loss_delta_bank` | `[N,S,R,C]` | Reference CE loss deltas for each rejection branch. |
+| `accept_target_objective_delta_bank` | `[N,S,A]` | Target branch objective deltas for each acceptance branch. |
+| `reject_target_objective_delta_bank` | `[N,S,R]` | Target branch objective deltas for each rejection branch. |
+| `reject_target_entropy_delta_bank` | `[N,S,R]` | Diagnostic target entropy delta for rejection branches only; not an efficiency numerator. |
+| `accept_branch_ids`, `reject_branch_ids` | `[A]`, `[R]` | Branch ids, v1 equal to probe type strings. |
+
+After Stage 4 selects `--response-step`, the step axis is removed and bank
+fields become `[N,A,C]`, `[N,R,C]`, `[N,A]`, or `[N,R]`. Primary singleton
+fields remain populated from the primary branch for current non-bank scoring
+paths. Old short cache field names are not supported.
+
+Stage 4 branch selectors choose which bank entries to materialize for scoring:
+
+```bash
+--accept-branch auto|all|<name_or_index>[,...]
+--reject-branch auto|all|<name_or_index>[,...]
+--branch-combine cross|zip
+```
+
+`reject_efficiency` uses rejection branches, `accept_efficiency` uses
+acceptance branches, and paired rules such as `ar_efficiency_contrast` use
+accept/reject pairs. For paired claim-oriented bank scoring, use
+`--accept-branch all --reject-branch all --branch-combine cross` unless a
+branch-selection ablation predeclares a narrower selector.
+
 ## TTA Response
 
-`tta_response` is the Stage 3 artifact. For each target dataset and `reference_set`, it stores:
+`tta_response` is the Stage 3 artifact. For each target dataset and Probe `P`, it stores:
 
+- `response_steps`, the saved update-step values selected by `--save-steps`.
 - Target labels, predictions, pretrained probabilities, confidence, entropy, margin, and energy.
 - Adapted target prediction summaries.
-- Base and adapted reference losses by class.
+- Base and adapted Probe `P` losses by class.
 - `response_delta_c = L_c(theta_T) - L_c(theta_0)`.
-- Reference class-wise confidence/entropy/margin/energy/correctness deltas.
+- Probe class-wise confidence/entropy/margin/energy/correctness deltas.
+- Optional Anchor `A` identity and anchor-loss diagnostics when configured.
+- Optional A/R singleton or response-bank accept/reject step-wise fields when
+  configured.
 - Perturbation diagnostic fields when configured.
 - Runtime per target.
 
@@ -201,7 +330,26 @@ Canonical primitive:
 response_delta_c = L_c(theta_T) - L_c(theta_0)
 ```
 
+For step-wise `tta_response`, Stage 4 applies this primitive after selecting
+one saved `response_step`. For example, `response_step=5` means
+`theta_T = theta_5`, the model after five target-update steps.
+
 `response_delta_c > 0` means reference loss increased. `response_delta_c < 0` means reference loss decreased.
+
+For A/R branch deltas, the canonical terms are:
+
+```text
+ref_loss_delta = after-before reference CE loss
+target_objective_delta = after-before branch-specific target objective
+ref_delta_penalty(mode) = scalarize(ref_loss_delta, mode)
+efficiency = -target_objective_delta / (eps + ref_delta_penalty(mode))
+```
+
+`ref_loss_delta` is always a Probe reference CE loss delta. By contrast,
+`target_objective_delta` follows the selected target branch objective, which
+may be CE, entropy, uniformity, view consistency, or another branch-specific
+objective. The negative numerator makes larger `efficiency` mean the target
+branch objective decreased more while the reference CE penalty stayed smaller.
 
 Claim score rules:
 
@@ -235,6 +383,25 @@ Diagnostic score rules can also produce `score_result` artifacts, but they are n
 | Magnitude-only summaries | Full `response_delta_c` vector | Test whether total response magnitude matters more than sign. |
 | Clean-prototype vector summaries | Clean-ID fit from `tta_response` | Test distance from clean response shape without fitting on csID/OOD. |
 | Perturbation-response summaries | Perturbation fields in `tta_response` | Test whether controlled target perturbation response preserves clean/csID alignment. |
+
+Acceptance/Rejection Probe adds explicit probe score rules. These are not part
+of `--score-rule all`; they must be selected directly or through
+`--score-rule probe_all`.
+
+| Probe score rule | Main inputs | Meaning |
+| --- | --- | --- |
+| `accept_efficiency` | `accept_target_objective_delta`, `accept_ref_loss_delta` | Target accept-branch objective decreases while reference CE penalty stays small. |
+| `reject_efficiency` | `reject_target_objective_delta`, `reject_ref_loss_delta` | Target reject-branch objective decreases while reference CE penalty stays small. |
+| `ar_efficiency_contrast` | accept efficiency, reject efficiency | Compare ID-compatible acceptance with ID-preserving rejection. |
+| `log_reject_efficiency` | `reject_target_objective_delta`, `reject_ref_loss_delta` | Log-ratio version of rejection efficiency with compressed scale. |
+
+Score construction note: the retained primary probe score is the simpler
+rejection-side `reject_efficiency`; the claim-oriented paired bank score is
+`ar_efficiency_contrast` once accept-target objective deltas are reported.
+Robust-z combinations should not be implemented as ordinary probe score rules,
+because Stage 4 calls those rules independently per split. Any robust
+normalization must be implemented through a clean-ID-fit path so the same
+normalizer is applied to ID, csID, near OOD, and far OOD.
 
 ## Protocol Handling
 

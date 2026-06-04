@@ -1,5 +1,7 @@
 # Score Density Plot Script 구현 계획
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 `scripts_my/tools/plot_score_density.py`를 새로 추가해, 저장된 `scores/*.npz`의 `conf` 값을 읽고 `ood_score = -conf` 기준으로 horizontal violin plot을 생성한다. 기본은 전체 데이터를 사용하고, 필요할 때만 `--max-samples`로 subsampling한다.
 

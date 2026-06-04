@@ -1,5 +1,7 @@
 # Random Model Sanity Check v1 구현 계획
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 - `scripts_my/tools/eval_random_ood.py`와 `scripts_my/runners/random_sanity.sh`를 추가해, checkpoint를 로드하지 않은 random model의 OOD/FSOOD AUROC와 score를 저장한다.
 - v1 범위는 `MSP`만 지원하고, dataset은 `cifar10,cifar100,imagenet,imagenet200`만 지원한다. `mnist`는 현재 `evaluation_api`에 없으므로 v1에서는 보류한다.

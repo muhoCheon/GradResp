@@ -1,5 +1,7 @@
 # TARR Reference Cache / Batch Hot-Path Optimization + Speed Evaluation Plan
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 기존 수정계획은 유지한다. 추가로 최적화 효과를 정량화하기 위해 **before/after runtime 비교**와 **batch-size sweep**을 별도 benchmark protocol로 추가한다. 목표는 score 정의와 response cache schema v5를 바꾸지 않고, reference candidate scan, reference bank setup, per-target adapted response의 속도 개선을 분리해서 측정하는 것이다.
 

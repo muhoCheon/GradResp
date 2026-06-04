@@ -67,9 +67,11 @@ conda run --no-capture-output -n openood python scripts_my/tarr/reference.py bui
   --num-workers 8
 ```
 
-## Stage 2: Build `reference_set`
+## Stage 2P: Build `reference_set` / Probe `P`
 
-Stage 2 selects a concrete reference set from an existing `train_candidate_metadata` artifact.
+Stage 2P selects the Probe/Measurement set `P` from an existing
+`train_candidate_metadata` artifact. This is the existing `reference_set`
+artifact, and all response scores are measured on this set.
 
 Output:
 
@@ -101,6 +103,43 @@ To copy a small image preview of the selected references, add:
   --write-preview \
   --preview-per-class 8
 ```
+
+## Stage 2A: Build `anchor_set` / Anchor `A`
+
+Stage 2A selects an optional Anchor set `A` from the same ID train metadata.
+Anchor `A` is used only as an update regularizer. It must be disjoint from the
+paired Probe `P` and is stored under `anchor_sets/`.
+
+Output:
+
+```text
+results_test/tarr/anchor_sets/<dataset>/<reference_config_id>/seed<seed>/<anchor_set_id>/
+  manifest.json
+  anchor_set.npz
+  selected_samples.csv
+  preview/                 # optional, only with --write-preview
+```
+
+### Generic Template
+
+Replace `<candidate_id>` and `<reference_set_id>` with the artifacts created by
+Stage 1 and Stage 2P. `--reference-config` should match the paired Probe `P`
+config; the builder excludes Probe `P` rows by reading
+`--probe-reference-set-dir`.
+
+```bash
+conda run --no-capture-output -n openood python scripts_my/tarr/reference.py build-anchor-set \
+  --dataset <dataset> \
+  --metadata results_test/tarr/train_candidate_metadata/<dataset>/<candidate_id>/candidates.npz \
+  --reference-config <reference_config_id>:per_class=<k>,filter=<filter>,seed=0 \
+  --probe-reference-set-dir results_test/tarr/reference_sets/<dataset>/<reference_config_id>/seed<seed>/<reference_set_id> \
+  --output-root results_test/tarr \
+  --anchor-set-batch-size <batch_size> \
+  --num-workers 8
+```
+
+Use the same filter, `per_class`, threshold, and seed as Probe `P` unless an
+ablation explicitly declares otherwise.
 
 ### Reference Config Policy
 
@@ -306,6 +345,10 @@ done
 ## Stage 3: Run `tta_response`
 
 Stage 3 runs target-only TTA and measures how each `reference_set` responds.
+`--steps` is the maximum update step count. `--save-steps` is an optional
+comma-separated list of update counts to save, for example `1,5,10`; it
+defaults to the final step only. Saved step-wise class fields use `[N,S,C]`,
+and saved scalar response fields use `[N,S]`, where `S=len(response_steps)`.
 
 ### Stage 3 Reference Grid
 
@@ -387,8 +430,10 @@ conda run --no-capture-output -n openood python scripts_my/tarr/eval.py run-resp
   --output-root results_test/tarr \
   "${REF_ARGS[@]}" \
   --use-prebuilt-reference-set \
+  --tta-mode normal \
   --objective predicted_label_ce \
   --steps 5 \
+  --save-steps 1,3,5 \
   --lr 1e-2 \
   --update-scope classifier \
   --runtime-mode auto \
@@ -408,8 +453,10 @@ conda run --no-capture-output -n openood python scripts_my/tarr/eval.py run-all 
   --run-id <run_id> \
   --output-root results_test/tarr \
   --reference-config all_rpc32:per_class=32,filter=all,seed=0 \
+  --tta-mode normal \
   --objective predicted_label_ce \
   --steps 5 \
+  --save-steps 5 \
   --lr 1e-2 \
   --update-scope classifier \
   --runtime-mode auto \
@@ -423,6 +470,168 @@ sharded `tta_response` and usually skip debug CSV rows:
 ```bash
   --tta-response-shard-size 1024 \
   --debug-output-mode none
+```
+
+### Probe/Anchor 2x2 Smoke Template
+
+This template documents the planned Acceptance/Rejection + Anchor ablation
+surface. Smoke rows are non-claim-bearing and must use sample limits.
+When `--save-steps` is used here, normal TARR saves existing-update responses
+and A/R saves accept/reject response fields for the same `response_steps`.
+
+```bash
+DATASET=cifar10
+PROTOCOL=eval_api
+SCHEME=fsood
+REFSEED=0
+REFERENCE_CONFIG=all_rpc8:per_class=8,filter=all,seed=${REFSEED}
+
+BATCH_SIZE=512
+REFERENCE_SET_BATCH_SIZE=2048
+TTA_RESPONSE_SHARD_SIZE=256
+DEBUG_OUTPUT_MODE=none
+NUM_WORKERS=0
+
+for ABLATION in baseline anchor_only accept_reject_only accept_reject_anchor; do
+  TTA_FLAGS=(--tta-mode normal --objective predicted_label_ce)
+  ANCHOR_FLAGS=()
+  SCORE_RULE=all
+
+  if [[ "${ABLATION}" == accept_reject_only || "${ABLATION}" == accept_reject_anchor ]]; then
+    TTA_FLAGS=(
+      --tta-mode ar_bank
+      --accept-probe-types predicted_label_ce,entropy_min,view_consistency
+      --reject-probe-types entropy_max,uniform
+    )
+    SCORE_RULE=probe_all
+  fi
+
+  if [[ "${ABLATION}" == anchor_only || "${ABLATION}" == accept_reject_anchor ]]; then
+    ANCHOR_FLAGS=(
+      --use-anchor-reference
+      --anchor-loss-type ce
+      --anchor-weight 0.1
+      --anchor-set-root results_test/tarr/anchor_sets
+    )
+  fi
+
+  RUN_ID=${DATASET}_${PROTOCOL}_${SCHEME}_${ABLATION}_smoke_refseed${REFSEED}
+
+  conda run --no-capture-output -n openood python scripts_my/tarr/eval.py run-response \
+    --dataset "${DATASET}" \
+    --baseline-protocol "${PROTOCOL}" \
+    --scheme "${SCHEME}" \
+    --run-id "${RUN_ID}" \
+    --ablation-type "${ABLATION}" \
+    --output-root results_test/tarr \
+    --reference-config "${REFERENCE_CONFIG}" \
+    --use-prebuilt-reference-set \
+    "${TTA_FLAGS[@]}" \
+    "${ANCHOR_FLAGS[@]}" \
+    --steps 5 \
+    --save-steps 1,3,5 \
+    --lr 1e-2 \
+    --update-scope classifier \
+    --runtime-mode auto \
+    --score-rule "${SCORE_RULE}" \
+    --batch-size "${BATCH_SIZE}" \
+    --reference-set-batch-size "${REFERENCE_SET_BATCH_SIZE}" \
+    --num-workers "${NUM_WORKERS}" \
+    --max-id-samples 128 \
+    --max-ood-samples 128 \
+    --save-tta-response \
+    --tta-response-shard-size "${TTA_RESPONSE_SHARD_SIZE}" \
+    --debug-output-mode "${DEBUG_OUTPUT_MODE}" \
+    --overwrite
+done
+```
+
+### Acceptance/Rejection Response Bank Template
+
+A/R response-bank runs save multiple acceptance and rejection branches in one
+Stage 3 artifact. The documented semantic accept bank is
+`predicted_label_ce,entropy_min,view_consistency`; do not include `topk_ce` or
+`allclass_ce` in default or claim-oriented accept banks. The semantic reject
+bank is `entropy_max,uniform`. `logit_suppression` may be run separately as an
+evidence/energy suppression branch, but it is not the semantic rejection
+default.
+
+```bash
+AR_ACCEPT_PROBES=predicted_label_ce,entropy_min,view_consistency
+AR_REJECT_PROBES=entropy_max,uniform
+TTA_ID=ar_semantic_bank_s5_lr1e2
+RUN_ID=${DATASET}_${PROTOCOL}_${SCHEME}_${TTA_ID}_refseed${REFSEED}
+RUN_DIR=results_test/tarr/outputs/${DATASET}/${PROTOCOL}/seed0/${RUN_ID}
+
+conda run --no-capture-output -n openood python scripts_my/tarr/eval.py run-response \
+  --dataset "${DATASET}" \
+  --baseline-protocol "${PROTOCOL}" \
+  --scheme "${SCHEME}" \
+  --run-id "${RUN_ID}" \
+  --output-root results_test/tarr \
+  "${REF_ARGS[@]}" \
+  --use-prebuilt-reference-set \
+  --tta-mode ar_bank \
+  --accept-probe-types "${AR_ACCEPT_PROBES}" \
+  --reject-probe-types "${AR_REJECT_PROBES}" \
+  --steps 5 \
+  --save-steps 1,3,5 \
+  --lr 1e-2 \
+  --perturbation-response pixel \
+  --perturbation-kind gaussian \
+  --perturbation-eps 0.01 \
+  --perturbation-repeats 4 \
+  --perturbation-seed 0 \
+  --update-scope classifier \
+  --runtime-mode auto \
+  --score-rule probe_all \
+  --batch-size "${BATCH_SIZE}" \
+  --reference-set-batch-size "${REFERENCE_SET_BATCH_SIZE}" \
+  --num-workers "${NUM_WORKERS}" \
+  --save-tta-response \
+  --tta-response-shard-size "${TTA_RESPONSE_SHARD_SIZE}" \
+  --debug-output-mode "${DEBUG_OUTPUT_MODE}" \
+  --overwrite
+```
+
+For a separate evidence/energy suppression run, keep the semantic accept bank
+unchanged and use `AR_REJECT_PROBES=logit_suppression` in the run id and
+analysis labels so it is not reported as semantic rejection.
+
+### Probe/Anchor 2x2 Full-Ablation Template
+
+Use the same four `ABLATION` values as the smoke template. Remove
+`--max-id-samples` and `--max-ood-samples`, restore the dataset-specific shard
+size, then run Stage 4 for `both`, `clean`, and `csid` as usual. Full
+experiments are not run in this documentation patch.
+
+```bash
+RUN_ID=${DATASET}_${PROTOCOL}_${SCHEME}_${ABLATION}_full_refseed${REFSEED}
+
+conda run --no-capture-output -n openood python scripts_my/tarr/eval.py run-response \
+  --dataset "${DATASET}" \
+  --baseline-protocol "${PROTOCOL}" \
+  --scheme "${SCHEME}" \
+  --run-id "${RUN_ID}" \
+  --ablation-type "${ABLATION}" \
+  --output-root results_test/tarr \
+  --reference-config "${REFERENCE_CONFIG}" \
+  --use-prebuilt-reference-set \
+  "${TTA_FLAGS[@]}" \
+  "${ANCHOR_FLAGS[@]}" \
+  --steps 5 \
+  --save-steps 1,3,5 \
+  --lr 1e-2 \
+  --update-scope classifier \
+  --runtime-mode auto \
+  --score-rule "${SCORE_RULE}" \
+  --batch-size "${BATCH_SIZE}" \
+  --reference-set-batch-size "${REFERENCE_SET_BATCH_SIZE}" \
+  --num-workers "${NUM_WORKERS}" \
+  --save-tta-response \
+  --tta-response-shard-size 1024 \
+  --debug-output-mode "${DEBUG_OUTPUT_MODE}" \
+  --overwrite
 ```
 
 ### Dataset-Wise Broad Search Template
@@ -616,6 +825,11 @@ PERT_ARGS=(--perturbation-response none)
 # STEPS=5
 # LR=1e-2
 # PERT_ARGS=(--perturbation-response pixel --perturbation-kind gaussian --perturbation-eps 0.01 --perturbation-repeats 4 --perturbation-seed 0)
+
+# Stage 3 saves these update counts. Stage 4 scores one selected saved step.
+# For final-step scoring, keep both equal to STEPS.
+SAVE_STEPS=${STEPS}
+RESPONSE_STEP=${STEPS}
 ```
 
 Run Stage 3:
@@ -632,8 +846,10 @@ conda run --no-capture-output -n openood python scripts_my/tarr/eval.py run-resp
   --output-root results_test/tarr \
   "${REF_ARGS[@]}" \
   --use-prebuilt-reference-set \
+  --tta-mode normal \
   --objective "${OBJECTIVE}" \
   --steps "${STEPS}" \
+  --save-steps "${SAVE_STEPS}" \
   --lr "${LR}" \
   "${PERT_ARGS[@]}" \
   --update-scope classifier \
@@ -665,6 +881,7 @@ for REF_ID in "${REF_IDS[@]}"; do
       --reference-config-id "${REF_ID}" \
       --dataset "${DATASET}" \
       --fsood-id-side "${SIDE}" \
+      --response-step "${RESPONSE_STEP}" \
       --score-rule all \
       --overwrite
   done
@@ -676,6 +893,7 @@ for REF_ID in "${REF_IDS[@]}"; do
       --reference-config-id "${REF_ID}" \
       --dataset "${DATASET}" \
       --fsood-id-side "${SIDE}" \
+      --response-step "${RESPONSE_STEP}" \
       --vector-score-rule all \
       --overwrite
   done
@@ -688,6 +906,7 @@ for REF_ID in "${REF_IDS[@]}"; do
         --reference-config-id "${REF_ID}" \
         --dataset "${DATASET}" \
         --fsood-id-side "${SIDE}" \
+        --response-step "${RESPONSE_STEP}" \
         --perturbation-score-rule all \
         --overwrite
     done
@@ -733,6 +952,10 @@ conda run --no-capture-output -n openood python scripts_my/tarr/reports.py compa
 Stage 4 converts saved `tta_response` artifacts into scalar OOD scores.
 During broad search, run Stage 4 immediately after each Stage 3 run and treat
 the run as complete only after `both`, `clean`, and `csid` score results exist.
+For step-wise responses, pass `--response-step <saved_step>` to select one of
+the `response_steps` stored by Stage 3. Claim-bearing score commands must log
+the selected `response_step`; use the final saved step unless a step ablation
+predeclares another value.
 
 Command shape:
 
@@ -743,7 +966,65 @@ conda run --no-capture-output -n openood python scripts_my/tarr/cache.py score \
   --reference-config-id all_rpc32 \
   --dataset <dataset> \
   --fsood-id-side both \
+  --response-step <saved_step> \
   --score-rule all \
+  --overwrite
+```
+
+For A/R response-bank `tta_response`, select branches in Stage 4. `all`
+evaluates every saved branch; `cross` evaluates every accept/reject pair for
+paired scores.
+
+The A/R efficiency score uses delta-based response fields:
+`ref_loss_delta` is after-before reference CE loss,
+`target_objective_delta` is after-before branch-specific target objective,
+`ref_delta_penalty(mode) = scalarize(ref_loss_delta, mode)`, and
+`efficiency = -target_objective_delta / (eps + ref_delta_penalty(mode))`.
+`ref_loss_delta` is always Probe reference CE; `target_objective_delta` follows
+the selected accept/reject branch objective.
+The concrete stored fields are `accept_ref_loss_delta`,
+`reject_ref_loss_delta`, `accept_target_objective_delta`,
+`reject_target_objective_delta`, plus the corresponding `_bank` fields.
+`reject_target_entropy_delta` is diagnostic only and is not the canonical
+efficiency numerator.
+
+```bash
+# Reject-only branch-bank score.
+conda run --no-capture-output -n openood python scripts_my/tarr/cache.py score \
+  --run-dir "${RUN_DIR}" \
+  --scheme fsood \
+  --reference-config-id all_rpc32 \
+  --dataset "${DATASET}" \
+  --fsood-id-side both \
+  --response-step final \
+  --score-rule reject_efficiency \
+  --reject-branch all \
+  --overwrite
+
+# Accept-only branch-bank score.
+conda run --no-capture-output -n openood python scripts_my/tarr/cache.py score \
+  --run-dir "${RUN_DIR}" \
+  --scheme fsood \
+  --reference-config-id all_rpc32 \
+  --dataset "${DATASET}" \
+  --fsood-id-side both \
+  --response-step final \
+  --score-rule accept_efficiency \
+  --accept-branch all \
+  --overwrite
+
+# Paired accept x reject branch-bank score.
+conda run --no-capture-output -n openood python scripts_my/tarr/cache.py score \
+  --run-dir "${RUN_DIR}" \
+  --scheme fsood \
+  --reference-config-id all_rpc32 \
+  --dataset "${DATASET}" \
+  --fsood-id-side both \
+  --response-step final \
+  --score-rule ar_efficiency_contrast \
+  --accept-branch all \
+  --reject-branch all \
+  --branch-combine cross \
   --overwrite
 ```
 

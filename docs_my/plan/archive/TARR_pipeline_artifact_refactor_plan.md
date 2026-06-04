@@ -1,5 +1,7 @@
 # TARR Pipeline Artifact Refactor Plan: No Legacy Compatibility
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 TARR artifact system을 네 단계로 단순화한다.
 

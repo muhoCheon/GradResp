@@ -35,6 +35,7 @@ TRAIN_CANDIDATE_METADATA_SCHEMA_VERSION = 2
 TRAIN_CANDIDATE_METADATA_FILE = 'candidates.npz'
 TRAIN_CANDIDATE_METADATA_MANIFEST_FILE = 'manifest.json'
 SELECTED_SAMPLES_CSV_FILE = 'selected_samples.csv'
+ANCHOR_SET_FILE = 'anchor_set.npz'
 
 
 def _require_torch():
@@ -139,6 +140,13 @@ def selected_reference_hash(labels, data):
     digest = hashlib.sha256()
     digest.update(labels.detach().cpu().numpy().astype('int64').tobytes())
     digest.update(data.detach().cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def candidate_indices_hash(candidate_indices):
+    values = np.asarray(candidate_indices, dtype=np.int64)
+    digest = hashlib.sha256()
+    digest.update(values.tobytes())
     return digest.hexdigest()
 
 
@@ -527,7 +535,26 @@ def _group_candidate_indices_by_class(metadata, mask, num_classes):
     return grouped_indices, starts, ends
 
 
-def select_train_candidate_indices(metadata, config, num_classes):
+def _exclude_candidate_indices_from_mask(mask, excluded_candidate_indices):
+    if excluded_candidate_indices is None:
+        return mask, 0
+    excluded = np.asarray(excluded_candidate_indices, dtype=np.int64)
+    if excluded.size == 0:
+        return mask, 0
+    if np.any(excluded < 0) or np.any(excluded >= len(mask)):
+        raise ValueError(
+            'excluded candidate index outside train metadata range '
+            f'0..{len(mask) - 1}')
+    excluded = np.unique(excluded)
+    mask = mask.copy()
+    mask[excluded] = False
+    return mask, int(len(excluded))
+
+
+def select_train_candidate_indices(metadata,
+                                   config,
+                                   num_classes,
+                                   excluded_candidate_indices=None):
     """Select candidate row indices for a reference config.
 
     Existing filters keep the previous class-wise reservoir sampling behavior.
@@ -538,6 +565,8 @@ def select_train_candidate_indices(metadata, config, num_classes):
     if config.per_class <= 0:
         raise ValueError(f'per_class must be positive: {config.per_class}')
     mask = train_candidate_filter_mask(metadata, config)
+    mask, excluded_count = _exclude_candidate_indices_from_mask(
+        mask, excluded_candidate_indices)
     grouped_indices, starts, ends = _group_candidate_indices_by_class(
         metadata, mask, num_classes)
     selected = []
@@ -558,8 +587,10 @@ def select_train_candidate_indices(metadata, config, num_classes):
         selected.extend(class_selected)
         selected_labels.extend([class_id] * len(class_selected))
     if missing:
+        suffix = ' after exclusions' if excluded_count else ''
         raise RuntimeError(
-            'Not enough reference samples for classes: ' + ', '.join(missing))
+            'Not enough reference samples' + suffix + ' for classes: ' +
+            ', '.join(missing))
     return (
         np.asarray(selected, dtype=np.int64),
         np.asarray(selected_labels, dtype=np.int64),
@@ -662,12 +693,13 @@ def _load_reference_samples_by_scan(data_loader, selected_scan_indices):
 
 
 def select_reference_tensors_from_train_metadata(data_loader, metadata, config,
-                                                 num_classes):
+                                                 num_classes,
+                                                 excluded_candidate_indices=None):
     """Return selected reference data and labels using candidate metadata."""
     _require_torch()
     metadata = _normalize_train_candidate_metadata(metadata)
     candidate_indices, labels = select_train_candidate_indices(
-        metadata, config, num_classes)
+        metadata, config, num_classes, excluded_candidate_indices)
     selected_scan_indices = metadata['scan_index'][candidate_indices]
     selected_dataset_indices = metadata['dataset_index'][candidate_indices]
     try:
@@ -881,6 +913,21 @@ def _format_reference_set_line(record, config):
         f"path={record.get('reference_set_dir')}")
 
 
+def _format_anchor_set_line(record, config):
+    manifest = record.get('manifest') or {}
+    preview = record.get('preview') or manifest.get('preview') or {}
+    action = 'reused' if record.get('reused') else 'built'
+    return (
+        f"[anchor-set] {action} "
+        f"id={record.get('anchor_set_id')} "
+        f"config={config.id} "
+        f"seed={config.seed} "
+        f"n={manifest.get('num_anchor')} "
+        f"probe={manifest.get('probe_reference_set_id')} "
+        f"preview={preview.get('num_copied', 0) if preview.get('enabled') else 0} "
+        f"path={record.get('anchor_set_dir')}")
+
+
 def write_reference_preview(preview_dir,
                             data_root,
                             train_data_dir,
@@ -952,6 +999,283 @@ def select_reference_from_train_candidate_metadata(train_metadata, data_loader,
                                                    config, num_classes):
     return select_reference_from_train_metadata(train_metadata, data_loader,
                                                config, num_classes)
+
+
+def _identity_digest(identity):
+    payload = json.dumps(identity, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def anchor_set_id(identity):
+    return _identity_digest(identity)
+
+
+def anchor_set_root(args):
+    root = getattr(args, 'anchor_set_root', None)
+    if root:
+        return Path(root)
+    return Path(args.output_root) / 'anchor_sets'
+
+
+def _load_train_metadata_record_from_path(metadata_path):
+    metadata_path = Path(metadata_path).expanduser().resolve()
+    manifest_path = metadata_path.parent / TRAIN_CANDIDATE_METADATA_MANIFEST_FILE
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f'train_candidate_metadata manifest not found: {manifest_path}')
+    with manifest_path.open() as f:
+        metadata_manifest = json.load(f)
+    metadata = load_train_candidate_metadata_file(metadata_path)
+    record = {
+        'metadata_dir': metadata_path.parent,
+        'metadata_path': metadata_path,
+        'manifest_path': manifest_path,
+        'manifest': metadata_manifest,
+        'identity': metadata_manifest.get('identity'),
+        'candidate_id': metadata_manifest.get('candidate_id'),
+        'reused': True,
+    }
+    return metadata, record
+
+
+def _parse_selected_candidate_index(raw_value, csv_path, line_number):
+    value = str(raw_value).strip()
+    if not value:
+        raise ValueError(
+            f'missing selected_candidate_index in {csv_path}:{line_number}')
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f'invalid selected_candidate_index in {csv_path}:{line_number}: '
+            f'{value!r}') from exc
+    if parsed < 0:
+        raise ValueError(
+            f'negative selected_candidate_index in {csv_path}:{line_number}: '
+            f'{parsed}')
+    return parsed
+
+
+def load_selected_candidate_indices_csv(path):
+    path = Path(path)
+    with path.open(newline='') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if 'selected_candidate_index' not in fieldnames:
+            raise ValueError(
+                f'{path} is missing selected_candidate_index column')
+        values = [
+            _parse_selected_candidate_index(
+                row.get('selected_candidate_index'), path, line_number)
+            for line_number, row in enumerate(reader, start=2)
+        ]
+    return np.asarray(values, dtype=np.int64)
+
+
+def _probe_reference_set_id(manifest):
+    probe_id = manifest.get('reference_set_id')
+    if probe_id:
+        return probe_id
+    identity = manifest.get('identity')
+    if identity:
+        return _identity_digest(identity)
+    raise ValueError('probe reference_set manifest is missing reference_set_id')
+
+
+def _probe_train_candidate_id(manifest):
+    identity = manifest.get('identity') or {}
+    candidate_info = identity.get('train_candidate_metadata') or {}
+    return candidate_info.get('candidate_id')
+
+
+def load_probe_reference_set_info(probe_reference_set_dir):
+    probe_dir = Path(probe_reference_set_dir).expanduser().resolve()
+    selected_samples_path = probe_dir / SELECTED_SAMPLES_CSV_FILE
+    manifest_path = probe_dir / 'manifest.json'
+    if not selected_samples_path.exists():
+        raise FileNotFoundError(
+            f'probe selected_samples.csv not found: {selected_samples_path}')
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f'probe reference_set manifest not found: {manifest_path}')
+    with manifest_path.open() as f:
+        manifest = json.load(f)
+    selected_candidate_indices = load_selected_candidate_indices_csv(
+        selected_samples_path)
+    excluded_indices = np.unique(selected_candidate_indices)
+    return {
+        'probe_reference_set_dir': probe_dir,
+        'selected_samples_path': selected_samples_path,
+        'manifest_path': manifest_path,
+        'manifest': manifest,
+        'probe_reference_set_id': _probe_reference_set_id(manifest),
+        'selected_candidate_indices': selected_candidate_indices,
+        'excluded_candidate_indices': excluded_indices,
+        'excluded_probe_selected_candidate_hash':
+        candidate_indices_hash(selected_candidate_indices),
+        'excluded_probe_selected_candidate_count':
+        int(len(selected_candidate_indices)),
+        'excluded_probe_unique_candidate_count': int(len(excluded_indices)),
+        'probe_train_candidate_id': _probe_train_candidate_id(manifest),
+    }
+
+
+def _validate_probe_train_metadata(probe_info, train_metadata_record):
+    probe_candidate_id = probe_info.get('probe_train_candidate_id')
+    current_candidate_id = train_metadata_record.get('candidate_id')
+    if (probe_candidate_id and current_candidate_id
+            and probe_candidate_id != current_candidate_id):
+        raise ValueError(
+            '--probe-reference-set-dir was built from train_candidate_metadata '
+            f'{probe_candidate_id}, but --metadata uses {current_candidate_id}')
+
+
+def _feature_backed_reference_bank(eval_mod,
+                                   net,
+                                   reference_data,
+                                   reference_label,
+                                   batch_size,
+                                   progress,
+                                   progress_desc):
+    features = []
+    losses = []
+    confidences = []
+    predictions = []
+    entropies = []
+    margins = []
+    energies = []
+    with torch.no_grad():
+        iterator = range(0, reference_label.numel(), batch_size)
+        if progress:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc=progress_desc)
+        for start in iterator:
+            end = start + batch_size
+            logits, feature = net(reference_data[start:end], return_feature=True)
+            diag = eval_mod.logit_diagnostics(logits)
+            loss = F.cross_entropy(
+                logits,
+                reference_label[start:end],
+                reduction='none',
+            )
+            features.append(feature.detach())
+            losses.append(loss.detach())
+            confidences.append(diag['conf'].detach())
+            predictions.append(diag['pred'].detach())
+            entropies.append(diag['entropy'].detach())
+            margins.append(diag['margin'].detach())
+            energies.append(diag['energy'].detach())
+    prediction = torch.cat(predictions)
+    return {
+        'features': torch.cat(features),
+        'label': reference_label,
+        'base_reference_sample_diag': {
+            'loss': torch.cat(losses),
+            'confidence': torch.cat(confidences),
+            'entropy': torch.cat(entropies),
+            'margin': torch.cat(margins),
+            'energy': torch.cat(energies),
+            'prediction': prediction,
+            'correct': prediction == reference_label,
+        },
+    }
+
+
+def _feature_backed_artifact_payload(bank):
+    payload = {
+        'features':
+        bank['features'].detach().cpu().numpy(),
+        'labels':
+        bank['label'].detach().cpu().numpy().astype(np.int64),
+        'selected_reference_hash':
+        np.asarray(bank['selected_reference_hash']),
+        'base_reference_loss':
+        bank['base_reference_sample_diag']['loss'].detach().cpu().numpy(),
+        'base_reference_confidence':
+        bank['base_reference_sample_diag']
+        ['confidence'].detach().cpu().numpy(),
+        'base_reference_entropy':
+        bank['base_reference_sample_diag']['entropy'].detach().cpu().numpy(),
+        'base_reference_margin':
+        bank['base_reference_sample_diag']['margin'].detach().cpu().numpy(),
+        'base_reference_energy':
+        bank['base_reference_sample_diag']['energy'].detach().cpu().numpy(),
+        'base_reference_prediction':
+        bank['base_reference_sample_diag']
+        ['prediction'].detach().cpu().numpy(),
+        'base_reference_correct':
+        bank['base_reference_sample_diag']['correct'].detach().cpu().numpy(),
+    }
+    metadata = bank.get('selected_metadata') or {}
+    for source, target in (
+        ('scan_index', 'selected_scan_index'),
+        ('dataset_index', 'selected_dataset_index'),
+        ('index', 'selected_dataset_index'),
+    ):
+        if source in metadata and target not in payload:
+            payload[target] = np.asarray(metadata[source])
+    return payload
+
+
+def _anchor_set_matches(output_dir, identity):
+    manifest_path = Path(output_dir) / 'manifest.json'
+    if not manifest_path.exists():
+        return False
+    with manifest_path.open() as f:
+        manifest = json.load(f)
+    if manifest.get('identity') != identity:
+        return False
+    return (Path(output_dir) / ANCHOR_SET_FILE).exists()
+
+
+def load_anchor_set(output_dir, identity):
+    output_dir = Path(output_dir)
+    if not _anchor_set_matches(output_dir, identity):
+        return None
+    with np.load(output_dir / ANCHOR_SET_FILE, allow_pickle=False) as data:
+        bank = {key: data[key] for key in data.files}
+    with (output_dir / 'manifest.json').open() as f:
+        manifest = json.load(f)
+    return {
+        'anchor_set_dir': output_dir,
+        'anchor_set_path': output_dir / ANCHOR_SET_FILE,
+        'manifest_path': output_dir / 'manifest.json',
+        'manifest': manifest,
+        'identity': identity,
+        'bank': bank,
+        'reused': True,
+    }
+
+
+def save_anchor_set(output_dir, identity, bank):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = _feature_backed_artifact_payload(bank)
+    np.savez_compressed(output_dir / ANCHOR_SET_FILE, **payload)
+    set_id = anchor_set_id(identity)
+    manifest = {
+        'schema_version': 1,
+        'artifact_type': 'anchor_set',
+        'identity': identity,
+        'anchor_set_id': set_id,
+        'probe_reference_set_id': identity['probe_reference_set_id'],
+        'excluded_probe_selected_candidate_hash':
+        identity['excluded_probe_selected_candidate_hash'],
+        'anchor_probe_disjoint': bool(identity['anchor_probe_disjoint']),
+        'num_anchor': int(bank['label'].numel()),
+        'created_at_unix': time.time(),
+        'fields': sorted(payload.keys()),
+    }
+    (output_dir / 'manifest.json').write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    return {
+        'anchor_set_dir': output_dir,
+        'anchor_set_path': output_dir / ANCHOR_SET_FILE,
+        'manifest_path': output_dir / 'manifest.json',
+        'manifest': manifest,
+        'identity': identity,
+        'reused': False,
+    }
 
 
 def _cli_build_train_metadata(args):
@@ -1120,53 +1444,17 @@ def _cli_build_reference_set(args):
         )
         return 0
 
-    features = []
-    losses = []
-    confidences = []
-    predictions = []
-    entropies = []
-    margins = []
-    energies = []
-    with torch.no_grad():
-        iterator = range(0, reference_label.numel(), args.reference_set_batch_size)
-        if args.progress:
-            from tqdm import tqdm
-            iterator = tqdm(
-                iterator,
-                desc=f'Build TARR reference_set {config.id}',
-            )
-        for start in iterator:
-            end = start + args.reference_set_batch_size
-            logits, feature = net(reference_data[start:end], return_feature=True)
-            diag = eval_mod.logit_diagnostics(logits)
-            loss = F.cross_entropy(
-                logits,
-                reference_label[start:end],
-                reduction='none',
-            )
-            features.append(feature.detach())
-            losses.append(loss.detach())
-            confidences.append(diag['conf'].detach())
-            predictions.append(diag['pred'].detach())
-            entropies.append(diag['entropy'].detach())
-            margins.append(diag['margin'].detach())
-            energies.append(diag['energy'].detach())
-    prediction = torch.cat(predictions)
-    bank = {
-        'features': torch.cat(features),
-        'label': reference_label,
-        'selected_reference_hash': selected_hash,
-        'selected_metadata': selection.selected_metadata,
-        'base_reference_sample_diag': {
-            'loss': torch.cat(losses),
-            'confidence': torch.cat(confidences),
-            'entropy': torch.cat(entropies),
-            'margin': torch.cat(margins),
-            'energy': torch.cat(energies),
-            'prediction': prediction,
-            'correct': prediction == reference_label,
-        },
-    }
+    bank = _feature_backed_reference_bank(
+        eval_mod,
+        net,
+        reference_data,
+        reference_label,
+        args.reference_set_batch_size,
+        args.progress,
+        f'Build TARR reference_set {config.id}',
+    )
+    bank['selected_reference_hash'] = selected_hash
+    bank['selected_metadata'] = selection.selected_metadata
     record = eval_mod.save_reference_set(output_dir, identity, bank)
     record['reference_set_id'] = set_id
     record = finalize_reference_set_artifacts(record, reused=False)
@@ -1174,6 +1462,165 @@ def _cli_build_reference_set(args):
         record,
         args.print_json,
         _format_reference_set_line(record, config),
+    )
+    return 0
+
+
+def _cli_build_anchor_set(args):
+    from argparse import Namespace
+    from scripts_my.tarr import eval as eval_mod
+
+    metadata, train_metadata_record = _load_train_metadata_record_from_path(
+        args.metadata)
+    config = parse_reference_config(args.reference_config)
+    if args.runtime_mode != 'classifier_feature_cache':
+        raise ValueError(
+            'build-anchor-set currently writes feature-backed anchor_set '
+            'artifacts and requires --runtime-mode classifier_feature_cache.')
+
+    probe_info = load_probe_reference_set_info(args.probe_reference_set_dir)
+    _validate_probe_train_metadata(probe_info, train_metadata_record)
+
+    checkpoint = args.checkpoint or eval_mod.DEFAULT_CHECKPOINT[args.dataset]
+    eval_mod.set_seed(args.seed)
+    net = eval_mod.build_model(args.dataset)
+    net.load_state_dict(eval_mod.load_checkpoint(checkpoint))
+    net.cuda()
+    net.eval()
+    classifier_name = eval_mod.classifier_layer_name(net)
+    loader = eval_mod.make_runtime_train_loader(
+        args.dataset,
+        args.anchor_set_batch_size,
+        args.num_workers,
+    )
+    selection = select_reference_tensors_from_train_metadata(
+        loader,
+        metadata,
+        config,
+        eval_mod.NUM_CLASSES[args.dataset],
+        excluded_candidate_indices=probe_info['excluded_candidate_indices'],
+    )
+    overlap = np.intersect1d(selection.selected_candidate_indices,
+                             probe_info['excluded_candidate_indices'])
+    if len(overlap):
+        raise RuntimeError(
+            'anchor selection overlaps probe selected_candidate_index rows: ' +
+            ', '.join(str(int(value)) for value in overlap[:20]))
+
+    anchor_probe_disjoint = True
+    reference_data = selection.data.cuda(non_blocking=True)
+    reference_label = selection.label.cuda(non_blocking=True)
+    selected_hash = selected_reference_hash(selection.label, selection.data)
+
+    stage_args = Namespace(
+        dataset=args.dataset,
+        checkpoint=args.checkpoint,
+        output_root=args.output_root,
+        seed=args.seed,
+    )
+    identity = eval_mod.reference_set_identity(
+        stage_args,
+        train_metadata_record,
+        config,
+        selected_hash,
+        classifier_name,
+        args.runtime_mode,
+    )
+    identity = dict(identity)
+    identity['artifact_type'] = 'anchor_set'
+    identity['probe_reference_set_id'] = probe_info['probe_reference_set_id']
+    identity['excluded_probe_selected_candidate_hash'] = (
+        probe_info['excluded_probe_selected_candidate_hash'])
+    identity['anchor_probe_disjoint'] = anchor_probe_disjoint
+    identity['excluded_probe_selected_candidate_count'] = (
+        probe_info['excluded_probe_selected_candidate_count'])
+
+    set_id = anchor_set_id(identity)
+    output_dir = (anchor_set_root(args) / args.dataset / config.id /
+                  f'seed{config.seed}' / set_id)
+    train_spec = eval_mod.dataset_spec(args.dataset, 'id', 'train')
+    data_root = eval_mod.ROOT_DIR / 'data'
+
+    def finalize_anchor_set_artifacts(record, reused):
+        preview_summary = {'enabled': False}
+        row_updates = [{
+            'preview_path': ''
+        } for _ in range(len(selection.label))]
+        if args.write_preview:
+            preview_summary = write_reference_preview(
+                output_dir / 'preview',
+                data_root,
+                train_spec['data_dir'],
+                selection.selected_metadata,
+                selection.label.detach().cpu().numpy(),
+                args.preview_per_class,
+            )
+            row_updates = preview_summary.pop('row_updates')
+        csv_summary = write_selected_samples_csv(
+            output_dir / SELECTED_SAMPLES_CSV_FILE,
+            selection.selected_metadata,
+            selected_candidate_indices=selection.selected_candidate_indices,
+            selected_labels=selection.label.detach().cpu().numpy(),
+            row_updates=row_updates,
+        )
+        manifest_path = output_dir / 'manifest.json'
+        manifest = {}
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+        manifest['artifact_type'] = 'anchor_set'
+        manifest['anchor_set_id'] = set_id
+        manifest['probe_reference_set_id'] = probe_info['probe_reference_set_id']
+        manifest['excluded_probe_selected_candidate_hash'] = (
+            probe_info['excluded_probe_selected_candidate_hash'])
+        manifest['anchor_probe_disjoint'] = anchor_probe_disjoint
+        manifest['selected_samples_csv'] = csv_summary
+        manifest['preview'] = preview_summary
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) +
+                                 '\n')
+        record = dict(record)
+        record['manifest'] = manifest
+        record['selected_samples_csv'] = csv_summary
+        record['preview'] = preview_summary
+        record['anchor_set_id'] = set_id
+        record['reused'] = bool(reused)
+        return record
+
+    if (not args.rebuild_anchor_set
+            and load_anchor_set(output_dir, identity) is not None):
+        summary = {
+            'anchor_set_dir': str(output_dir),
+            'anchor_set_path': str(output_dir / ANCHOR_SET_FILE),
+            'manifest_path': str(output_dir / 'manifest.json'),
+            'anchor_set_id': set_id,
+            'identity': identity,
+            'reused': True,
+        }
+        summary = finalize_anchor_set_artifacts(summary, reused=True)
+        _print_json_or_line(
+            summary,
+            args.print_json,
+            _format_anchor_set_line(summary, config),
+        )
+        return 0
+
+    bank = _feature_backed_reference_bank(
+        eval_mod,
+        net,
+        reference_data,
+        reference_label,
+        args.anchor_set_batch_size,
+        args.progress,
+        f'Build TARR anchor_set {config.id}',
+    )
+    bank['selected_reference_hash'] = selected_hash
+    bank['selected_metadata'] = selection.selected_metadata
+    record = save_anchor_set(output_dir, identity, bank)
+    record['anchor_set_id'] = set_id
+    record = finalize_anchor_set_artifacts(record, reused=False)
+    _print_json_or_line(
+        record,
+        args.print_json,
+        _format_anchor_set_line(record, config),
     )
     return 0
 
@@ -1243,6 +1690,50 @@ def build_arg_parser():
         help='reference config, e.g. per_class=4,filter=correct,seed=0',
     )
     reference_set.set_defaults(func=_cli_build_reference_set)
+
+    anchor_set = subparsers.add_parser(
+        'build-anchor-set',
+        help='select anchor rows disjoint from a probe reference_set',
+    )
+    anchor_set.add_argument(
+        '--dataset',
+        required=True,
+        choices=['cifar10', 'cifar100', 'imagenet', 'imagenet200'],
+    )
+    anchor_set.add_argument('--checkpoint')
+    anchor_set.add_argument('--output-root', default='results_test/tarr')
+    anchor_set.add_argument('--anchor-set-root')
+    anchor_set.add_argument('--anchor-set-batch-size',
+                            '--reference-set-batch-size',
+                            dest='anchor_set_batch_size',
+                            type=int,
+                            default=512)
+    anchor_set.add_argument('--runtime-mode',
+                            default='classifier_feature_cache',
+                            choices=['classifier_feature_cache'])
+    anchor_set.add_argument('--num-workers', type=int, default=8)
+    anchor_set.add_argument('--seed', type=int, default=0)
+    anchor_set.add_argument('--rebuild-anchor-set', action='store_true')
+    anchor_set.add_argument('--progress', action='store_true')
+    anchor_set.add_argument('--print-json', action='store_true')
+    anchor_set.add_argument('--write-preview', action='store_true')
+    anchor_set.add_argument('--preview-per-class', type=int, default=8)
+    anchor_set.add_argument(
+        '--metadata',
+        required=True,
+        help='path to candidates.npz',
+    )
+    anchor_set.add_argument(
+        '--reference-config',
+        required=True,
+        help='anchor config, e.g. per_class=4,filter=correct,seed=0',
+    )
+    anchor_set.add_argument(
+        '--probe-reference-set-dir',
+        required=True,
+        help='path to the probe reference_set directory containing selected_samples.csv',
+    )
+    anchor_set.set_defaults(func=_cli_build_anchor_set)
     return parser
 
 

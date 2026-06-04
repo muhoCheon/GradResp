@@ -102,6 +102,9 @@ AGGREGATE_TO_COLUMNS = {
     ('fsood', 'nearood'): ('FSOOD Near AUROC', 'FSOOD Near FPR95'),
     ('fsood', 'farood'): ('FSOOD Far AUROC', 'FSOOD Far FPR95'),
 }
+SCORE_FAMILY_DIRS = {'vector', 'perturbation'}
+
+
 def load_json(path):
     return json.loads(Path(path).read_text())
 
@@ -479,6 +482,10 @@ def collect_caches(args):
     return caches
 
 
+def diagnostic_ood_score(cache, score_rule):
+    return ood_score_from_cache(cache, score_rule)
+
+
 def delta_features(cache):
     delta = cache['delta']
     row = np.arange(delta.shape[0])
@@ -503,7 +510,7 @@ def build_score_summary(caches, score_rules):
                 'score_rule': score_rule,
                 'split': item['split'],
                 'dataset': item['dataset'],
-            }, ood_score_from_cache(item['cache'], score_rule)))
+            }, diagnostic_ood_score(item['cache'], score_rule)))
     return rows
 
 
@@ -694,9 +701,45 @@ def read_score_manifest(score_dir):
     return {}
 
 
+def parse_score_result_parts(parts):
+    parts = list(parts)
+    score_family = 'score'
+    if parts and parts[0] in SCORE_FAMILY_DIRS:
+        score_family = parts.pop(0)
+    fsood_id_side = 'both'
+    if parts and parts[0].startswith('id_side_'):
+        fsood_id_side = parts.pop(0).replace('id_side_', '', 1)
+    score_rule = parts[0] if parts else ''
+    variant_parts = parts[1:] if parts else []
+    return score_family, fsood_id_side, score_rule, variant_parts
+
+
+def score_result_leaf_dirs(score_dir, score_rule):
+    score_dir = Path(score_dir)
+    bases = [score_dir] if score_rule == 'all' else [score_dir / score_rule]
+    seen = set()
+    for base in bases:
+        if not base.exists():
+            continue
+        candidates = []
+        if (base / 'scores').exists():
+            candidates.append(base)
+        candidates.extend(path.parent for path in sorted(base.glob('**/scores')))
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield path
+
+
 def score_result_rules(score_dir, score_rule):
     if score_rule != 'all':
-        return [score_rule]
+        rules = [
+            '/'.join(path.relative_to(score_dir).parts)
+            for path in score_result_leaf_dirs(score_dir, score_rule)
+        ]
+        return rules or [score_rule]
     manifest = read_score_manifest(score_dir)
     rules = [
         rule for rule in manifest.get('expanded_score_rules', [])
@@ -705,8 +748,8 @@ def score_result_rules(score_dir, score_rule):
     if rules:
         return rules
     return [
-        path.name for path in sorted(Path(score_dir).iterdir())
-        if path.is_dir() and (path / 'scores').exists()
+        '/'.join(path.relative_to(score_dir).parts)
+        for path in score_result_leaf_dirs(score_dir, score_rule)
     ]
 
 
@@ -758,13 +801,14 @@ def collect_score_result_items(args):
         args.run_dir, args.scheme, args.reference_config_id,
         args.score_kind, args.fsood_id_side)
     manifest = read_score_manifest(score_dir)
-    rules = score_result_rules(score_dir, args.score_rule)
-    if not rules:
+    result_dirs = list(score_result_leaf_dirs(score_dir, args.score_rule))
+    if not result_dirs:
         raise FileNotFoundError(f'No score rules found under {score_dir}')
 
     items = []
-    for score_rule in rules:
-        scores_dir = score_dir / score_rule / 'scores'
+    for result_dir in result_dirs:
+        score_rule = '/'.join(result_dir.relative_to(score_dir).parts)
+        scores_dir = result_dir / 'scores'
         if not scores_dir.exists():
             continue
         for name, split, dataset_name in score_dataset_names(args, manifest):
@@ -1014,9 +1058,9 @@ def build_alignment_summary(run_dir, scheme, reference_config_id, caches,
     if id_items and csid_items:
         clean_cache = id_items[0]['cache']
         for score_rule in score_rules:
-            clean_scores = ood_score_from_cache(clean_cache, score_rule)
+            clean_scores = diagnostic_ood_score(clean_cache, score_rule)
             csid_scores = np.concatenate([
-                ood_score_from_cache(item['cache'], score_rule)
+                diagnostic_ood_score(item['cache'], score_rule)
                 for item in csid_items
             ])
             clean_q05, clean_q95 = np.quantile(clean_scores, [0.05, 0.95])
@@ -1588,13 +1632,13 @@ def build_score_direction(caches, score_rules):
     id_cache = id_items[0]['cache']
     rows = []
     for score_rule in score_rules:
-        id_ood_score = ood_score_from_cache(id_cache, score_rule)
+        id_ood_score = diagnostic_ood_score(id_cache, score_rule)
         id_mean = float(np.mean(id_ood_score))
         id_median = float(np.median(id_ood_score))
         for item in caches:
             if item['split'] == 'id':
                 continue
-            ood_score = ood_score_from_cache(item['cache'], score_rule)
+            ood_score = diagnostic_ood_score(item['cache'], score_rule)
             mean_delta = float(np.mean(ood_score) - id_mean)
             median_delta = float(np.median(ood_score) - id_median)
             rows.append({
@@ -1619,7 +1663,7 @@ def build_failure_cases(caches, score_rules, top_k):
         cache = item['cache']
         features = delta_features(cache)
         for score_rule in score_rules:
-            ood_score = ood_score_from_cache(cache, score_rule)
+            ood_score = diagnostic_ood_score(cache, score_rule)
             order = np.argsort(ood_score)
             if item['split'] in {'id', 'csid'}:
                 selected = order[-top_k:][::-1]
@@ -1913,24 +1957,11 @@ def infer_score_context(metric_path):
     except ValueError as exc:
         raise ValueError(
             f'Unexpected score result metric path: {metric_path}') from exc
-    score_rule = metric_path.parent.name
-    score_results_parts = parts[score_results_index + 1:-2]
-    id_side_index = None
-    for idx, name in enumerate(score_results_parts):
-        if name.startswith('id_side_'):
-            id_side_index = idx
-            break
-    if id_side_index is None:
-        fsood_id_side = 'both'
-        family_parts = score_results_parts
-    else:
-        fsood_id_side = score_results_parts[id_side_index].replace(
-            'id_side_', '', 1)
-        family_parts = score_results_parts[:id_side_index]
-    if family_parts:
-        score_family = family_parts[0]
-    else:
-        score_family = 'score'
+    score_results_parts = parts[score_results_index + 1:-1]
+    score_family, fsood_id_side, score_rule, variant_parts = (
+        parse_score_result_parts(score_results_parts))
+    score_result_id = '/'.join(
+        part for part in [score_rule, *variant_parts] if part)
 
     score_results_dir = Path(*parts[:score_results_index + 1])
     if (score_results_index >= 2
@@ -1946,6 +1977,7 @@ def infer_score_context(metric_path):
         'scheme': scheme_dir.name,
         'reference_config_id': reference_config_id,
         'score_rule': score_rule,
+        'score_result_id': score_result_id,
         'score_family': score_family,
         'fsood_id_side': fsood_id_side,
         'score_results_dir': score_results_dir,
@@ -1967,6 +1999,7 @@ def collect_score_rows(metric_path):
             'reference_config_id': context['reference_config_id'],
             'score_family': context['score_family'],
             'score_rule': context['score_rule'],
+            'score_result_id': context['score_result_id'],
             'fsood_id_side': context['fsood_id_side'],
             'aggregate': aggregate,
             'diagnostic_only': (
@@ -2008,6 +2041,7 @@ def run_collect_score(args):
         'reference_config_id',
         'score_family',
         'score_rule',
+        'score_result_id',
         'fsood_id_side',
         'aggregate',
         'diagnostic_only',
@@ -2087,6 +2121,8 @@ def run_compare_group1(args):
     tarr_rows = read_tarr_rows(args.tarr_summary, args.dataset,
                                args.baseline_protocol, args.score_rule,
                                args.reference_config_id)
+    if args.run_id:
+        tarr_rows = [row for row in tarr_rows if row.get('run_id') == args.run_id]
     dataset_label = group1_dataset_label(args.dataset)
     baseline_rows = [
         row for (dataset, _), row in group_rows.items() if dataset == dataset_label
@@ -2219,6 +2255,7 @@ def build_parser():
     compare.add_argument('--dataset', required=True)
     compare.add_argument('--score-rule', required=True)
     compare.add_argument('--reference-config-id')
+    compare.add_argument('--run-id')
     compare.add_argument('--output-csv',
                          default='results_test/tarr/summary/tarr_vs_group1.csv')
     compare.set_defaults(func=run_compare_group1)

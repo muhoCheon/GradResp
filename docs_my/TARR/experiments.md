@@ -12,24 +12,31 @@ A result is claim-bearing only when it is produced by the full four-stage TARR p
 train_candidate_metadata -> reference_set -> tta_response -> score_result
 ```
 
+For the Probe/Anchor plan, the existing `reference_set` is the
+Probe/Measurement set `P`. The optional new `anchor_set` is Anchor `A`, stored
+under `anchor_sets/`, and regularizes the target update only. Scores remain
+measured on Probe `P`.
+
 Stage requirements:
 
 - Stage 1, `train_candidate_metadata`: built from the ID train split only, using the declared dataset, train imglist, checkpoint, model, and preprocessor.
-- Stage 2, `reference_set`: selected only from the Stage 1 metadata. The reference filter, per-class count, confidence threshold, and reference seed must be recorded.
-- Stage 3, `tta_response`: run on the full target splits required by the scheme. For FSOOD, this means clean ID, csID, near semantic OOD, and far semantic OOD. No `--max-id-samples` or `--max-ood-samples` limit may be used for a claim-bearing row.
-- Stage 4, `score_result`: computed from the saved `tta_response` and written under `score_results/<score_rule>/` for the reported score rule and FSOOD ID-side setting.
+- Stage 2P, `reference_set` / Probe `P`: selected only from the Stage 1 metadata. The reference filter, per-class count, confidence threshold, and reference seed must be recorded.
+- Stage 2A, `anchor_set` / Anchor `A`, when enabled: selected only from Stage 1 metadata, stored under `anchor_sets/`, and disjoint from the paired Probe `P`.
+- Stage 3, `tta_response`: run on the full target splits required by the scheme. For FSOOD, this means clean ID, csID, near semantic OOD, and far semantic OOD. `--steps` is the maximum update step count; `--save-steps` records the saved `response_steps` and defaults to the final step only. No `--max-id-samples` or `--max-ood-samples` limit may be used for a claim-bearing row.
+- Stage 4, `score_result`: computed from the saved `tta_response` and written under `score_results/<score_rule>/` for the reported score rule, selected `response_step`, and FSOOD ID-side setting.
 
 Identity and validation requirements:
 
 - The manifests must match the reported `dataset`, `scheme`, `baseline_protocol`, csID identity, checkpoint identity, and imglist SHA256.
 - `ood_score` must be stored in the OOD-like direction. OpenOOD `conf` is `-ood_score`.
+- Claim-bearing rows must record the selected `response_step`; if multiple `response_steps` were saved, the reported row is tied to exactly one Stage 4 `--response-step`.
 - Smoke or subset runs are code/runtime checks only. They can justify implementation or resource settings, but they are not used for performance claims.
 
 Inline scoring and offline scoring are two ways to run Stage 4. They produce the same `score_result` artifact when the `tta_response` input and scoring config match.
 
 ## Current Goal
 
-Find the best TARR TTA setting separately for each dataset. The primary internal criterion is whether FSOOD `both` score_result improves over the default TARR setting for the same dataset: `predicted_label_ce`, `steps=5`, `lr=1e-2`, `refseed=0`. 
+Find the best TARR TTA setting separately for each dataset. The primary internal criterion is whether FSOOD `both` score_result improves over the default TARR setting for the same dataset: `predicted_label_ce`, `steps=5`, final `response_step=5`, `lr=1e-2`, `refseed=0`.
 
 Diagnostics track whether the score distribution follows:
 
@@ -111,15 +118,16 @@ memory-bound.
 One full broad-search execution unit is:
 
 ```text
-dataset + eval_api + fsood + TTA config + reference seed
+dataset + eval_api + fsood + TTA config + response_step + reference seed
 ```
 
-Each execution unit bundles 15 prebuilt `reference_set` configs and then runs Stage 4 immediately after Stage 3.
+Each execution unit bundles 15 prebuilt `reference_set` configs and then runs
+Stage 4 immediately after Stage 3 for the selected `response_step`.
 
 Required post-run artifacts for a completed execution unit:
 
 - `tta_response` for clean ID, csID, near OOD, and far OOD target splits.
-- Active `score_result` for `both`, `clean`, and `csid` FSOOD ID-side scoring.
+- Active `score_result` for `both`, `clean`, and `csid` FSOOD ID-side scoring at the selected `response_step`.
 - Vector diagnostic `score_result`.
 - Perturbation diagnostic `score_result` for soft-view runs.
 - Diagnostics for each reference config.
@@ -163,6 +171,27 @@ Transfer policy:
 - ImageNet-200: run the full 18-config grid at `refseed=0` using the measured five-process/GPU setting with `num_workers=2`.
 - ImageNet-1K: run only selected candidates first. Full 18-config broad search is disk-expensive and should not be the default.
 - Refseed robustness is run only after the dataset-wise `refseed=0` screen identifies promising candidates.
+
+## Probe/Anchor 2x2 Plan
+
+Acceptance/Rejection Probe and Anchor `A` are separate improvement axes.
+Anchor `A` should first use ID train samples disjoint from Probe `P`; do not
+optimize Anchor selection before the basic 2x2 result is understood.
+
+| Setting | Acceptance/Rejection | Anchor `A` | Purpose |
+| --- | --- | --- | --- |
+| Baseline TARR | off | off | Existing Probe `P` measurement baseline. |
+| Anchor only | off | on | Test whether ID-surface regularization stabilizes the existing objective. |
+| Acceptance/Rejection only | on | off | Test whether acceptance-vs-rejection compatibility contrast adds signal. |
+| Acceptance/Rejection + Anchor | on | on | Test whether the two axes are complementary. |
+
+Smoke commands are code/runtime checks only and must use sample limits. Full
+ablation rows remove sample limits, run Stage 4 for `both`, `clean`, and
+`csid`, and pass the same validation gates as the current four-stage pipeline.
+
+Status in this patch: implementation and smoke-test commands are added, but
+full Probe/Anchor ablation experiments are not run here. The existing
+dataset-wise best table is unchanged until full rows pass validation.
 
 ## Reference Seed Plan
 
@@ -239,7 +268,7 @@ Promotion rules:
 Internal TARR baseline per dataset:
 
 ```text
-predicted_label_ce, steps=5, lr=1e-2, refseed=0, active score_rule=all
+predicted_label_ce, steps=5, response_step=5, lr=1e-2, refseed=0, active score_rule=all
 ```
 
 External baseline comparison uses Group 1 via `reports.py compare-group1`. Because `compare-group1` expects one exact score rule, run it for selected active score rules after `collect-score` identifies the relevant TARR rows.
@@ -481,9 +510,10 @@ Use this log for decisions that affect the search tree.
 | Stage | Artifact | Experiment variables | Reuse rule |
 | --- | --- | --- | --- |
 | 1 | `train_candidate_metadata` | Dataset, train imglist, checkpoint, model arch/classes, preprocessing identity, metadata schema | Reuse only when the identity exactly matches. |
-| 2 | `reference_set` | Source, filter, per-class size, confidence threshold, seed | Reuse only with the same Stage 1 input and selected-sample identity. |
-| 3 | `tta_response` | Scheme, target split, TTA objective, steps, lr, update scope, runtime mode, perturbation config | New Stage 3 run when target protocol or TTA config changes. |
-| 4 | `score_result` | Score rule, ID-side aggregation for FSOOD, score direction | Recompute from matching `tta_response` without rerunning TTA. |
+| 2P | `reference_set` / Probe `P` | Source, filter, per-class size, confidence threshold, seed | Reuse only with the same Stage 1 input and selected-sample identity. |
+| 2A | `anchor_set` / Anchor `A` | Source, filter, per-class size, confidence threshold, seed, paired Probe exclusion | Reuse only with the same Stage 1 input, selected-sample identity, and Probe exclusion identity. |
+| 3 | `tta_response` | Scheme, target split, TTA objective, max `steps`, saved `response_steps`, lr, update scope, runtime mode, perturbation config | New Stage 3 run when target protocol or TTA config changes. |
+| 4 | `score_result` | Score rule, selected `response_step`, ID-side aggregation for FSOOD, score direction | Recompute from matching `tta_response` without rerunning TTA. |
 
 Batch sizes and worker counts are runtime settings. They can support cost claims only when reported with the same protocol, hardware, target count, and artifact identities.
 
@@ -496,6 +526,10 @@ results_test/tarr/train_candidate_metadata/<dataset>/<candidate_id>/candidates.n
 results_test/tarr/reference_sets/<dataset>/<reference_config_id>/seed<seed>/<reference_set_id>/manifest.json
 results_test/tarr/reference_sets/<dataset>/<reference_config_id>/seed<seed>/<reference_set_id>/reference_set.npz
 results_test/tarr/reference_sets/<dataset>/<reference_config_id>/seed<seed>/<reference_set_id>/selected_samples.csv
+
+results_test/tarr/anchor_sets/<dataset>/<reference_config_id>/seed<seed>/<anchor_set_id>/manifest.json
+results_test/tarr/anchor_sets/<dataset>/<reference_config_id>/seed<seed>/<anchor_set_id>/anchor_set.npz
+results_test/tarr/anchor_sets/<dataset>/<reference_config_id>/seed<seed>/<anchor_set_id>/selected_samples.csv
 
 results_test/tarr/outputs/<dataset>/<baseline_protocol>/seed<seed>/<run_id>/run_manifest.json
 results_test/tarr/outputs/<dataset>/<baseline_protocol>/seed<seed>/<run_id>/run_info.md
@@ -534,9 +568,10 @@ Every reported row must include:
 - Full/subset status.
 - `train_candidate_metadata_id`.
 - `reference_set_id` and `reference_config_id`.
-- TTA config: objective, steps, lr, update scope, runtime mode, view/perturbation config.
+- `anchor_set_id`, paired `reference_config_id`, anchor loss weight, and Probe/Anchor disjointness identity when Anchor `A` is enabled.
+- TTA config: objective, max `steps`, saved `response_steps`, lr, update scope, runtime mode, view/perturbation config.
 - `tta_response` storage, shard count, and target split list.
-- Score rule and `score_result_id`.
+- Score rule, selected `response_step`, and `score_result_id`.
 - Score direction and OpenOOD confidence transform.
 - AUROC/FPR95 metrics and output paths.
 - Runtime by stage.
@@ -648,3 +683,178 @@ Decision: use five ImageNet-200 Stage 3 processes per GPU with `num_workers=2`
 as the Stage 3-only broad-search default. If Stage 4 is overlapped or host IO
 pressure appears, reduce to four processes per GPU. Use sharded `tta_response`
 and keep `debug_output_mode=none`.
+
+## Acceptance/Rejection Probe Current Claim Path
+
+Date: 2026-06-02, revised 2026-06-03.
+
+The class-hypothesis acceptance-search branch was removed from the current code
+and documentation. It produced some empirical signal, especially on CIFAR-100,
+but it is hard to defend as a paper claim and expensive to ablate cleanly. Those
+old results are therefore treated as non-claim-bearing exploratory evidence and
+are not used as promoted configurations.
+
+Current documented acceptance probes for claim-bearing A/R response-bank runs:
+
+```text
+predicted_label_ce
+entropy_min
+view_consistency
+```
+
+Do not include `topk_ce` or `allclass_ce` in default/documented accept banks.
+
+Current documented semantic rejection probes:
+
+```text
+entropy_max
+uniform
+```
+
+`logit_suppression` can remain only as a separate evidence/energy suppression
+branch. It is not a semantic rejection probe and should not be mixed into the
+default semantic bank.
+
+With `--save-steps`, A/R stores accept and reject responses for each saved
+update count. Class-wise accept/reject deltas use `[N,S,C]`; scalar fields such
+as `accept_target_objective_delta` and `reject_target_objective_delta` use `[N,S]`.
+Response-bank runs additionally store accept and reject bank axes, for example
+`[N,S,A,C]`, `[N,S,R,C]`, `[N,S,A]`, and `[N,S,R]`. The bank field names are
+`accept_ref_loss_delta_bank`, `reject_ref_loss_delta_bank`,
+`accept_target_objective_delta_bank`, and `reject_target_objective_delta_bank`.
+`reject_target_entropy_delta` is diagnostic only and is not the canonical
+efficiency numerator. Stage 4 must score one selected `response_step` and
+record it with the claim-bearing row.
+
+Use the delta-based efficiency definition for A/R interpretation:
+`ref_loss_delta` is after-before reference CE loss, `target_objective_delta` is
+after-before branch-specific target objective,
+`ref_delta_penalty(mode) = scalarize(ref_loss_delta, mode)`, and
+`efficiency = -target_objective_delta / (eps + ref_delta_penalty(mode))`.
+The reference side is always Probe CE; the target side follows the selected
+accept/reject branch objective.
+
+Stage 3 runner flags for banked A/R:
+
+```text
+--tta-mode ar_bank
+--accept-probe-types predicted_label_ce,entropy_min,view_consistency
+--reject-probe-types entropy_max,uniform
+```
+
+Stage 4 branch-bank scoring flags:
+
+```text
+reject_efficiency:       --reject-branch all
+accept_efficiency:       --accept-branch all
+ar_efficiency_contrast:  --accept-branch all --reject-branch all --branch-combine cross
+```
+
+Interpretation policy:
+
+- `entropy_max` and `uniform` are the main semantic rejection probes.
+- `logit_suppression` remains only an evidence/energy suppression probe.
+- `reject_efficiency` is the primary A/R score.
+- Anchor-only and full-batch A/R+Anchor CE did not show a clear gain in the
+  completed focused tests.
+
+Claim-compatible results retained from the previous focused runs:
+
+| dataset | branch | reference | score_rule | both AUROC | clean AUROC | csID AUROC | decision |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| cifar10 | default TARR | `correct_rpc32` | `positive_loss_increase_mean` | 78.02 | 89.63 | 67.58 | A/R not promoted from CIFAR-10 |
+| cifar100 | claim-compatible A/R branch | `correct_rpc32` | `reject_efficiency` | 61.86 | 71.50 | 53.18 | improves csID ordering but does not beat default TARR |
+| imagenet200 | `predicted_label_ce + entropy_max` | `correct_rpc32` | `reject_efficiency` | 63.24 | 74.12 | 60.38 | promoted for near/both analysis |
+
+Current decision:
+
+```text
+Primary A/R claim path:
+  acceptance: predicted_label_ce, entropy_min, view_consistency
+  rejection: entropy_max or uniform
+  score: reject_efficiency initially; ar_efficiency_contrast for paired
+         branch-bank claim analysis
+
+Suppressive regularizer branch:
+  logit_suppression can remain as a separate branch, but only as
+  a raw-logit suppressive regularizer.
+
+Do not promote:
+  class-hypothesis acceptance search
+  anchor-only CE/distill/param_reg
+  full-batch A/R + Anchor CE
+  direct positive-reference-delta contrast as primary score
+  discarded Stage 4 score-construction variants
+```
+
+Full-spectrum audit after this revision:
+
+- CIFAR-100 needs to be rerun with claim-compatible A/R branches before it can
+  be used as positive evidence.
+- ImageNet-200 still supports the semantic A/R idea for near-OOD and csID
+  ordering, but far-OOD remains weak versus ASH.
+- ImageNet-1K should remain blocked until ImageNet-200 far-OOD improves.
+
+Recommended next actions:
+
+1. Rerun CIFAR-100 using only the retained acceptance probes and semantic
+   rejection probes.
+2. Add a far-shift-sensitive Stage 3 response field, such as energy response,
+   feature drift, activation sparsity, or reference activation stability.
+3. Keep `reject_efficiency` as the primary score unless a new Stage 3 response
+   justifies a new score.
+
+## Stage 4-Only Score Construction Audit
+
+Date: 2026-06-02.
+
+Saved A/R `tta_response` was reused to test whether score construction alone
+could improve csID/far-OOD separation without rerunning Stage 3. The retained
+result is:
+
+```text
+Primary A/R score: reject_efficiency
+```
+
+For step-wise `tta_response`, this audit applies after Stage 4 selects the
+declared `response_step`; it is not a license to pick an unreported best step.
+
+The attempted Stage 4 score-construction variants did not improve over
+`reject_efficiency` and are not used as score rules or calibration methods in
+the current code. They were removed from the current search space.
+
+Decision:
+
+```text
+Keep:
+  reject_efficiency
+
+Drop from current search:
+  direct positive-reference-delta contrast as primary score
+  discarded Stage 4 score-construction variants
+  response-shape score variants
+```
+
+Reason:
+
+```text
+Score-only construction was not enough. To improve far-OOD while preserving
+near-OOD, the Stage 3 TTA/probe response itself needs an additional
+far-shift-sensitive measurement. Do not continue Stage 4 formula search
+with the current saved response fields.
+```
+
+Next TTA implication:
+
+```text
+semantic branch:
+  current A/R reject_efficiency
+
+far-shift branch:
+  new Stage 3 response field such as feature drift, activation sparsity,
+  energy response, or reference activation stability
+
+final score:
+  simple combination of semantic branch and far-shift branch after the new
+  response field is validated
+```

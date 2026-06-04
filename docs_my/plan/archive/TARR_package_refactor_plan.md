@@ -1,5 +1,7 @@
 # TARR Package Refactor + Multi-Reference Cache Plan
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 TARR 코드를 `scripts_my/tarr/` package로 리팩터링하고, TTA/reference/scoring/protocol 축을 명확히 분리한다. TARR 실행/분석 entrypoint는 새 package 아래로 통합한다. 추가로 같은 TTA pass에서 여러 reference config를 평가할 수 있는 **multi-reference evaluation**을 지원해 reference ablation 비용을 줄인다.
 

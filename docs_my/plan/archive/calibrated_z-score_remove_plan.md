@@ -1,5 +1,7 @@
 # Calibrated Z-Score Diagnostic 제거 계획
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 목표는 TARR의 current code/documentation에서 `calibrated z-score` diagnostic score family를 제거하고, active/vector/perturbation score 경로만 남기는 것이다. Calibration/hybrid score는 claim protocol이 명확해지는 최종 단계에서 새로 설계한다.
 

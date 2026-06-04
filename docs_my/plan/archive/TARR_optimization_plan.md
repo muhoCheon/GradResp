@@ -1,5 +1,7 @@
 # TARR Hot-Path Optimization + FSOOD-Only Search 운영 계획
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 목표는 TARR score 정의와 claim protocol을 바꾸지 않고 full-run 실험 속도를 줄이는 것이다. 이번 범위에는 이전에 합의한 최적화 항목 `1~6, 9`를 포함하고, `run_matrix.py` 2-GPU scheduler와 `--scheme both` 코드 변경은 제외한다.
 

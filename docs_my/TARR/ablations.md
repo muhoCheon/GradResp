@@ -48,7 +48,8 @@ Required checks:
 | Axis | Candidates | Purpose |
 | --- | --- | --- |
 | Objective | `predicted_label_ce`, `entropy`, `memo_marginal_entropy`, `view_consistency_js`, `view_consistency_kl`, `entropy_consistency` | Compare target-only adaptation signals. |
-| Steps | `1`, `5`, `10`, optional `20/30` | Response strength/runtime tradeoff. |
+| Max `steps` | `1`, `5`, `10`, optional `20/30` | Maximum update budget and response strength/runtime tradeoff. |
+| Saved `response_steps` | final only, or predeclared lists such as `1,5,10` | Store step-wise response without rerunning Stage 3. |
 | Learning rate | `1e-2`, `3e-2`, optional `1e-3` | Stability and over-adaptation check. |
 | Update scope | `classifier`, optional `all` | Compare efficient classifier-only update against broader adaptation. |
 | Runtime mode | `auto`, `full_forward`, `classifier_feature_cache` | Verify metric parity and cost. |
@@ -59,7 +60,9 @@ BN running-stat updates remain deferred unless a TTA objective explicitly requir
 
 ### Stage 4: `score_result`
 
-Score rules are compared from the same `tta_response` whenever possible.
+Score rules are compared from the same `tta_response` whenever possible. For
+step-wise `tta_response`, each claim row must predeclare and record the selected
+`response_step`.
 
 Claim score rules:
 

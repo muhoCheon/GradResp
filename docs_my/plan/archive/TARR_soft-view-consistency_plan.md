@@ -1,5 +1,7 @@
 # TARR Soft View-Consistency Objective 전환 계획
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 hard argmax-matching 기반 TTA objective와 diagnostic을 모두 제거한다. 새 claim 후보는 argmax 일치율이 아니라 perturbation view의 soft distribution 정보를 쓰는 objective로만 구성한다.
 

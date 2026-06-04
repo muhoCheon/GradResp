@@ -1,5 +1,7 @@
 # Shared Reference Candidate Cache + `correct_confidence_stratified` 구현 계획
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 `correct_confidence_stratified`를 추가하면서, reference build를 config별 train full scan 방식에서 **dataset/checkpoint 단위 shared candidate metadata cache** 기반으로 바꾼다. 같은 dataset, train imglist, checkpoint, model/preprocessing identity가 같으면 여러 run과 여러 reference filter ablation에서 train prediction metadata를 재사용한다.
 

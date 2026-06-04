@@ -114,7 +114,7 @@ def lr_tag(value):
 
 def run_id(args, protocol, seed):
     tta_id = (
-        f'{args.objective}_s{args.steps}_lr{lr_tag(args.lr)}'
+        f'normal_{args.objective}_s{args.steps}_lr{lr_tag(args.lr)}'
         f'_{args.update_scope}_{args.runtime_mode}'
     )
     ref_id = short_token(args.reference_config)
@@ -148,6 +148,8 @@ def command_for_job(args, protocol, seed, rid):
         args.reference_filter,
         '--reference-min-confidence',
         str(args.reference_min_confidence),
+        '--tta-mode',
+        'normal',
         '--objective',
         args.objective,
         '--steps',

@@ -1,5 +1,7 @@
 # TARR Large-Dataset Sharded NPZ Response Cache Plan
 
+> Archive note: This plan is historical. Use docs_my/TARR/ and scripts_my/tarr/ as the current source of truth unless this file is explicitly referenced for context.
+
 ## Summary
 ImageNet-1K full run에서 split 전체 response cache를 메모리에 쌓다가 kill되는 문제를 해결한다. 기존 CIFAR/small-cache single `.npz` 경로는 유지하고, ImageNet-scale run에서는 response cache를 shard 단위로 streaming 저장한다. Score output은 기존 single `.npz`로 유지한다.
 

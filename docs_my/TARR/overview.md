@@ -27,11 +27,14 @@ The current claim-bearing implementation is the `scripts_my/tarr/` package pipel
 - ID train `train_candidate_metadata`.
 - ID train `reference_set`.
 - Canonical loss-response score rules that write `score_result`.
+- Acceptance/Rejection response-bank runs with documented accept probes
+  `predicted_label_ce`, `entropy_min`, `view_consistency` and semantic reject
+  probes `entropy_max`, `uniform`.
 - Runtime modes `auto`, `full_forward`, and `classifier_feature_cache`.
 
-Planned extensions remain outside claim scope until separately specified: energy objective, soft pseudo-label CE, calibrated hybrid scoring, and OpenOOD postprocessor integration.
+Planned extensions remain outside claim scope until separately specified: energy objective, soft pseudo-label CE, far-shift response branches, and OpenOOD postprocessor integration. `logit_suppression` is only an evidence/energy suppression probe, not semantic rejection. `topk_ce` and `allclass_ce` are not default/documented accept probes.
 
-Every claim-bearing run must write manifests that identify the dataset, baseline protocol, csID datasets, checkpoint SHA256, imglist SHA256, full/subset status, `train_candidate_metadata_id`, `reference_set_id`, TTA config, `tta_response` config, score rule, and `score_result_id`.
+Every claim-bearing run must write manifests that identify the dataset, baseline protocol, csID datasets, checkpoint SHA256, imglist SHA256, full/subset status, `train_candidate_metadata_id`, `reference_set_id`, TTA config, `tta_response` config including `response_steps`, score rule, selected `response_step`, and `score_result_id`.
 
 ## Claims To Validate
 
@@ -84,13 +87,13 @@ Select class-balanced ID train references from `train_candidate_metadata`. The s
 For each target sample:
 
 1. Save pretrained target response.
-2. Run target-only TTA for the configured objective, step count, learning rate, update scope, and runtime mode.
-3. Measure adapted response on each `reference_set`.
-4. Store target diagnostics, reference losses, response deltas, perturbation diagnostics when configured, and runtime.
+2. Run target-only TTA for the configured objective, max `--steps`, learning rate, update scope, and runtime mode.
+3. Measure adapted response on each `reference_set` at the saved `response_steps` selected by `--save-steps`.
+4. Store target diagnostics, reference losses, response deltas, perturbation diagnostics when configured, and runtime. Step-wise class fields use `[N,S,C]`; scalar response fields use `[N,S]`. A/R response-bank fields add accept/reject branch axes, for example `[N,S,A,C]` and `[N,S,R,C]`.
 
 ### Stage 4: `score_result`
 
-Apply a score rule to `tta_response`. Stage 4 writes OpenOOD score files, `ood.csv`, score direction metadata, and any ID-side aggregation used for FSOOD. Running Stage 4 immediately after Stage 3 and running it later from saved `tta_response` are equivalent when the inputs match.
+Apply a score rule to `tta_response`. For step-wise responses, Stage 4 selects one saved update count with `--response-step` before scoring. For A/R response-bank artifacts, Stage 4 also selects branches with `--accept-branch`, `--reject-branch`, and `--branch-combine`. Stage 4 writes OpenOOD score files, `ood.csv`, score direction metadata, and any ID-side aggregation used for FSOOD. Running Stage 4 immediately after Stage 3 and running it later from saved `tta_response` are equivalent when the inputs match.
 
 ## Score Convention
 
@@ -160,6 +163,12 @@ Canonical score rules:
 - `mean_loss_decrease = -mean_c response_delta_c`
 - `positive_loss_increase_mean = mean_c max(response_delta_c, 0)`
 - `positive_loss_decrease_mean = mean_c max(-response_delta_c, 0)`
+
+A/R response-bank score rules are selected directly or with
+`--score-rule probe_all`. `reject_efficiency` scores rejection branches,
+`accept_efficiency` scores acceptance branches, and
+`ar_efficiency_contrast` scores accept/reject branch pairs, usually with
+`--accept-branch all --reject-branch all --branch-combine cross`.
 
 Each score rule produces a `score_result`. New score rules must fix formula and direction before they are used for claim-bearing comparison.
 

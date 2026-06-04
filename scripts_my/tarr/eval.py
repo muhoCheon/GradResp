@@ -68,10 +68,13 @@ from scripts_my.tarr.scoring import (
     DELTA_DEFINITION,
     PERTURBATION_DEFINITION,
     PERTURBATION_SCORE_DIRECTION,
+    PROBE_SCORE_RULES,
     SCORE_DIRECTION,
     SCORE_RULE_CHOICES,
+    ood_score_from_cache,
     score_from_delta,
     selected_perturbation_score_rules,
+    selected_probe_score_rules,
     selected_score_rules,
 )
 
@@ -115,6 +118,18 @@ PERTURBATION_CACHE_POLICY_CODES = {
     'auto': 0,
     'error_on_feature_cache': 1,
 }
+ANCHOR_LOSS_TYPES = ['none', 'ce', 'distill', 'param_reg']
+ACCEPT_PROBE_TYPES = [
+    'predicted_label_ce',
+    'entropy_min',
+    'view_consistency',
+]
+REJECT_PROBE_TYPES = [
+    'entropy_max',
+    'uniform',
+    'logit_suppression',
+]
+TTA_MODES = ['normal', 'ar_bank']
 SOFT_VIEW_OBJECTIVES = {
     'view_consistency_kl',
     'view_consistency_js',
@@ -122,6 +137,102 @@ SOFT_VIEW_OBJECTIVES = {
 }
 VIEW_PERTURBATION_OBJECTIVES = SOFT_VIEW_OBJECTIVES | {'memo_marginal_entropy'}
 DEFAULT_PREFETCH_FACTOR = 2
+
+
+def parse_response_steps(value, max_steps):
+    if value is None or str(value).strip() == '':
+        return [int(max_steps)]
+    steps = []
+    for raw in str(value).split(','):
+        token = raw.strip()
+        if not token:
+            continue
+        try:
+            step = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f'--save-steps entries must be integers: {token}') from exc
+        if step < 1:
+            raise ValueError('--save-steps entries must be positive.')
+        if step > int(max_steps):
+            raise ValueError(
+                f'--save-steps entry {step} exceeds --steps {max_steps}.')
+        steps.append(step)
+    if not steps:
+        raise ValueError('--save-steps must contain at least one step.')
+    return sorted(set(steps))
+
+
+def parse_probe_type_list(value, choices, option_name):
+    if value is None or str(value).strip() == '':
+        return None
+    items = []
+    seen = set()
+    for raw in str(value).split(','):
+        token = raw.strip()
+        if not token:
+            continue
+        if token not in choices:
+            raise ValueError(
+                f'{option_name} entry {token!r} is invalid; choices are '
+                f'{", ".join(choices)}.')
+        if token in seen:
+            raise ValueError(
+                f'{option_name} contains duplicate probe type {token!r}.')
+        seen.add(token)
+        items.append(token)
+    if not items:
+        raise ValueError(f'{option_name} must contain at least one probe type.')
+    return items
+
+
+def normalize_probe_banks(args, parser):
+    try:
+        accept_bank = parse_probe_type_list(
+            args.accept_probe_types, ACCEPT_PROBE_TYPES, '--accept-probe-types')
+        reject_bank = parse_probe_type_list(
+            args.reject_probe_types, REJECT_PROBE_TYPES, '--reject-probe-types')
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.tta_mode == 'normal':
+        if args.objective is None:
+            parser.error('--tta-mode normal requires --objective.')
+        if accept_bank is not None or reject_bank is not None:
+            parser.error(
+                '--accept-probe-types/--reject-probe-types are valid only '
+                'with --tta-mode ar_bank.')
+        args.use_accept_reject_probe = False
+        args.use_response_bank = False
+        args.accept_probe_type_bank = []
+        args.reject_probe_type_bank = []
+        args.accept_probe_type = ''
+        args.reject_probe_type = ''
+        args.primary_accept_branch_id = ''
+        args.primary_reject_branch_id = ''
+        args.accept_branch_ids = []
+        args.reject_branch_ids = []
+        return
+
+    if args.objective is not None:
+        parser.error('--objective is valid only with --tta-mode normal.')
+    if accept_bank is None:
+        parser.error('--tta-mode ar_bank requires --accept-probe-types.')
+    if reject_bank is None:
+        parser.error('--tta-mode ar_bank requires --reject-probe-types.')
+
+    args.use_accept_reject_probe = True
+    args.accept_probe_type_bank = accept_bank
+    args.reject_probe_type_bank = reject_bank
+    args.use_response_bank = True
+
+    # Primary fields keep the first branch available for existing cache readers.
+    args.accept_probe_type = accept_bank[0]
+    args.reject_probe_type = reject_bank[0]
+    args.primary_accept_branch_id = accept_bank[0]
+    args.primary_reject_branch_id = reject_bank[0]
+    args.accept_branch_ids = list(accept_bank)
+    args.reject_branch_ids = list(reject_bank)
 
 
 def parse_args(argv=None):
@@ -145,6 +256,13 @@ def parse_args(argv=None):
         '--experiment-tag',
         default='',
         help='Free-form label such as strict_transfer or c100_tuned.',
+    )
+    parser.add_argument(
+        '--ablation-type',
+        default='auto',
+        help=('Experiment ablation label, e.g. baseline, anchor_only, '
+              'accept_reject_only, accept_reject_anchor, anchor_sweep, '
+              'probe_sweep, or score_sweep. Logged in manifests only.'),
     )
     parser.add_argument('--overwrite',
                         action='store_true',
@@ -172,10 +290,23 @@ def parse_args(argv=None):
               '<id>:per_class=<int>,filter=<name>,min_confidence=<float>,seed=<int>. '
               'If omitted, the single-reference options are used.'),
     )
+    parser.add_argument('--tta-mode',
+                        required=True,
+                        choices=TTA_MODES,
+                        help=('normal runs one target TTA objective; ar_bank '
+                              'runs independent acceptance/rejection response '
+                              'banks.'))
     parser.add_argument('--objective',
-                        default='predicted_label_ce',
-                        choices=OBJECTIVES)
+                        default=None,
+                        choices=OBJECTIVES,
+                        help='Normal TARR update objective. Valid only with --tta-mode normal.')
     parser.add_argument('--steps', type=int, default=1)
+    parser.add_argument(
+        '--save-steps',
+        default='',
+        help=('Comma-separated update steps at which to save target/reference '
+              'responses. Defaults to --steps. Example: 5,10,30.'),
+    )
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--update-scope',
                         default='classifier',
@@ -203,6 +334,29 @@ def parse_args(argv=None):
     parser.add_argument('--score-rule',
                         default='predicted_class_loss_increase',
                         choices=SCORE_RULE_CHOICES)
+    parser.add_argument('--use-anchor-reference',
+                        action='store_true',
+                        help='Use prebuilt anchor_set artifacts in the update loss.')
+    parser.add_argument(
+        '--anchor-set-root',
+        help='Directory for reusable anchor_set artifacts. Defaults to <output-root>/anchor_sets.',
+    )
+    parser.add_argument('--anchor-loss-type',
+                        default='none',
+                        choices=ANCHOR_LOSS_TYPES)
+    parser.add_argument(
+        '--accept-probe-types',
+        default='',
+        help=('Comma-separated acceptance probe bank. Required with '
+              '--tta-mode ar_bank. The first branch is the primary cache view.'),
+    )
+    parser.add_argument(
+        '--reject-probe-types',
+        default='',
+        help=('Comma-separated rejection probe bank. Required with '
+              '--tta-mode ar_bank. The first branch is the primary cache view.'),
+    )
+    parser.add_argument('--anchor-weight', type=float, default=0.0)
     parser.add_argument('--freeze-bn-stats',
                         dest='freeze_bn_stats',
                         action='store_true',
@@ -284,6 +438,13 @@ def parse_args(argv=None):
     parser.add_argument('--no-progress', action='store_true')
     args = parser.parse_args(argv)
     args.command = command
+    if args.steps < 1:
+        parser.error('--steps must be positive.')
+    try:
+        args.response_steps = parse_response_steps(args.save_steps, args.steps)
+    except ValueError as exc:
+        parser.error(str(exc))
+    normalize_probe_banks(args, parser)
     if args.perturbation_eps < 0:
         parser.error('--perturbation-eps must be non-negative.')
     if args.perturbation_repeats < 1:
@@ -292,6 +453,43 @@ def parse_args(argv=None):
         parser.error('--train-candidate-batch-size must be non-negative.')
     if args.tta_response_shard_size < 0:
         parser.error('--tta-response-shard-size must be non-negative.')
+    if args.anchor_weight < 0:
+        parser.error('--anchor-weight must be non-negative.')
+    if args.use_anchor_reference:
+        if args.anchor_loss_type == 'none':
+            parser.error('--use-anchor-reference requires --anchor-loss-type != none.')
+        if args.anchor_weight <= 0:
+            parser.error('--use-anchor-reference requires --anchor-weight > 0.')
+        if args.anchor_loss_type in {'ce', 'distill'}:
+            if args.update_scope != 'classifier':
+                parser.error(
+                    'anchor_loss_type ce/distill requires --update-scope classifier.')
+            if args.runtime_mode not in {'auto', 'classifier_feature_cache'}:
+                parser.error(
+                    'anchor_loss_type ce/distill requires classifier feature cache runtime.')
+    if not args.use_anchor_reference and args.anchor_loss_type != 'none':
+        parser.error('--anchor-loss-type != none requires --use-anchor-reference.')
+    if args.score_rule == 'probe_all' and args.tta_mode != 'ar_bank':
+        parser.error('--score-rule probe_all requires --tta-mode ar_bank.')
+    if args.score_rule in PROBE_SCORE_RULES and args.tta_mode != 'ar_bank':
+        parser.error(
+            f'--score-rule {args.score_rule} requires --tta-mode ar_bank.')
+    if (args.tta_mode == 'ar_bank'
+            and 'view_consistency' in args.accept_probe_type_bank):
+        if args.perturbation_response not in {'pixel', 'feature'}:
+            parser.error(
+                'accept_probe_type=view_consistency requires '
+                '--perturbation-response pixel or feature.')
+        if args.perturbation_kind != 'gaussian':
+            parser.error(
+                'accept_probe_type=view_consistency currently supports only '
+                '--perturbation-kind gaussian.')
+        if args.perturbation_eps <= 0:
+            parser.error('accept_probe_type=view_consistency requires --perturbation-eps > 0.')
+        if args.perturbation_repeats < 2:
+            parser.error(
+                'accept_probe_type=view_consistency requires '
+                '--perturbation-repeats >= 2.')
     if args.objective in VIEW_PERTURBATION_OBJECTIVES:
         if args.perturbation_response not in {'pixel', 'feature'}:
             parser.error(
@@ -455,106 +653,89 @@ def save_npz(path, pred, conf, label):
 
 def save_tta_response(path, scores):
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        pred=scores['pred'].astype(np.int64),
-        label=scores['label'].astype(np.int64),
-        y_hat=scores['y_hat'].astype(np.int64),
-        target_conf=scores['target_conf'].astype(np.float64),
-        target_entropy=scores['target_entropy'].astype(np.float64),
-        target_probs=scores['target_probs'].astype(np.float32),
-        target_margin=scores['target_margin'].astype(np.float64),
-        target_energy=scores['target_energy'].astype(np.float64),
-        perturbation_logit_l2=scores['perturbation_logit_l2'].astype(np.float64),
-        perturbation_prob_l1=scores['perturbation_prob_l1'].astype(np.float64),
-        perturbation_conf_delta=scores[
-            'perturbation_conf_delta'].astype(np.float64),
-        perturbation_entropy_delta=scores[
-            'perturbation_entropy_delta'].astype(np.float64),
-        perturbation_response_code=scores[
-            'perturbation_response_code'].astype(np.int64),
-        perturbation_kind_code=scores['perturbation_kind_code'].astype(np.int64),
-        perturbation_eps=scores['perturbation_eps'].astype(np.float64),
-        perturbation_repeats=scores['perturbation_repeats'].astype(np.int64),
-        perturbation_seed=scores['perturbation_seed'].astype(np.int64),
-        perturbation_cache_policy_code=scores[
-            'perturbation_cache_policy_code'].astype(np.int64),
-        perturbation_config_id=np.asarray(scores['perturbation_config_id']),
-        perturbation_response=np.asarray(scores['perturbation_response']),
-        perturbation_kind=np.asarray(scores['perturbation_kind']),
-        perturbation_cache_policy=np.asarray(scores['perturbation_cache_policy']),
-        perturbation_eps_config=np.asarray(
-            scores['perturbation_eps_config'], dtype=np.float64),
-        perturbation_repeats_config=np.asarray(
-            scores['perturbation_repeats_config'], dtype=np.int64),
-        perturbation_seed_config=np.asarray(
-            scores['perturbation_seed_config'], dtype=np.int64),
-        target_tta_loss_before=scores['target_tta_loss_before'].astype(np.float64),
-        target_tta_loss_after=scores['target_tta_loss_after'].astype(np.float64),
-        post_tta_pred=scores['post_tta_pred'].astype(np.int64),
-        post_tta_target_conf=scores['post_tta_target_conf'].astype(np.float64),
-        post_tta_target_entropy=scores['post_tta_target_entropy'].astype(np.float64),
-        post_tta_target_probs=scores['post_tta_target_probs'].astype(np.float32),
-        post_tta_pseudo_label_prob=scores[
-            'post_tta_pseudo_label_prob'].astype(np.float64),
-        adapted_target_pred=scores['adapted_target_pred'].astype(np.int64),
-        adapted_target_conf=scores['adapted_target_conf'].astype(np.float64),
-        adapted_target_entropy=scores['adapted_target_entropy'].astype(np.float64),
-        adapted_target_margin=scores['adapted_target_margin'].astype(np.float64),
-        adapted_target_energy=scores['adapted_target_energy'].astype(np.float64),
-        adapted_target_probs=scores['adapted_target_probs'].astype(np.float32),
-        target_conf_delta=scores['target_conf_delta'].astype(np.float64),
-        target_entropy_delta=scores['target_entropy_delta'].astype(np.float64),
-        target_margin_delta=scores['target_margin_delta'].astype(np.float64),
-        target_energy_delta=scores['target_energy_delta'].astype(np.float64),
-        target_pred_changed=scores['target_pred_changed'].astype(np.int64),
-        base_reference_loss=scores['base_reference_loss'].astype(np.float32),
-        adapted_reference_loss=scores['adapted_reference_loss'].astype(np.float32),
-        delta=scores['delta'].astype(np.float32),
-        reference_conf_delta_by_class=scores[
-            'reference_conf_delta_by_class'].astype(np.float32),
-        reference_entropy_delta_by_class=scores[
-            'reference_entropy_delta_by_class'].astype(np.float32),
-        reference_margin_delta_by_class=scores[
-            'reference_margin_delta_by_class'].astype(np.float32),
-        reference_energy_delta_by_class=scores[
-            'reference_energy_delta_by_class'].astype(np.float32),
-        reference_pred_changed_rate_by_class=scores[
-            'reference_pred_changed_rate_by_class'].astype(np.float32),
-        reference_correct_rate_before_by_class=scores[
-            'reference_correct_rate_before_by_class'].astype(np.float32),
-        reference_correct_rate_after_by_class=scores[
-            'reference_correct_rate_after_by_class'].astype(np.float32),
-        base_reference_loss_mean=scores['base_reference_loss_mean'].astype(np.float64),
-        base_reference_loss_std=scores['base_reference_loss_std'].astype(np.float64),
-        base_reference_loss_min=scores['base_reference_loss_min'].astype(np.float64),
-        base_reference_loss_max=scores['base_reference_loss_max'].astype(np.float64),
-        adapted_reference_loss_mean=scores[
-            'adapted_reference_loss_mean'].astype(np.float64),
-        adapted_reference_loss_std=scores[
-            'adapted_reference_loss_std'].astype(np.float64),
-        adapted_reference_loss_min=scores[
-            'adapted_reference_loss_min'].astype(np.float64),
-        adapted_reference_loss_max=scores[
-            'adapted_reference_loss_max'].astype(np.float64),
-        reference_delta_mean=scores['reference_delta_mean'].astype(np.float64),
-        reference_delta_std=scores['reference_delta_std'].astype(np.float64),
-        reference_delta_min=scores['reference_delta_min'].astype(np.float64),
-        reference_delta_max=scores['reference_delta_max'].astype(np.float64),
-        reference_delta_positive_mean=scores[
-            'reference_delta_positive_mean'].astype(np.float64),
-        runtime_per_sample=scores['runtime_per_sample'].astype(np.float64),
-        score_rules=np.asarray(selected_score_rules(scores['args_score_rule'])),
-        args_score_rule=np.asarray(scores['args_score_rule']),
-        reference_config_id=np.asarray(scores['reference_config_id']),
-        cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int64),
-        score_direction=np.asarray(SCORE_DIRECTION),
-        delta_definition=np.asarray(DELTA_DEFINITION),
-        perturbation_score_rules=np.asarray(
+    payload = {
+        'pred': scores['pred'].astype(np.int64),
+        'label': scores['label'].astype(np.int64),
+        'score_rules': np.asarray(selected_score_rules(scores['args_score_rule'])),
+        'args_score_rule': np.asarray(scores['args_score_rule']),
+        'reference_config_id': np.asarray(scores['reference_config_id']),
+        'cache_schema_version': np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int64),
+        'score_direction': np.asarray(SCORE_DIRECTION),
+        'delta_definition': np.asarray(DELTA_DEFINITION),
+        'perturbation_score_rules': np.asarray(
             selected_perturbation_score_rules('all')),
-        perturbation_score_direction=np.asarray(PERTURBATION_SCORE_DIRECTION),
-        perturbation_definition=np.asarray(PERTURBATION_DEFINITION),
-    )
+        'perturbation_score_direction': np.asarray(PERTURBATION_SCORE_DIRECTION),
+        'perturbation_definition': np.asarray(PERTURBATION_DEFINITION),
+    }
+    int_keys = {
+        'y_hat',
+        'perturbation_response_code',
+        'perturbation_kind_code',
+        'perturbation_repeats',
+        'perturbation_seed',
+        'perturbation_cache_policy_code',
+        'post_tta_pred',
+        'adapted_target_pred',
+        'target_pred_changed',
+    }
+    float32_keys = {
+        'target_probs',
+        'post_tta_target_probs',
+        'adapted_target_probs',
+        'base_reference_loss',
+        'adapted_reference_loss',
+        'delta',
+        'reference_conf_delta_by_class',
+        'reference_entropy_delta_by_class',
+        'reference_margin_delta_by_class',
+        'reference_energy_delta_by_class',
+        'reference_pred_changed_rate_by_class',
+        'reference_correct_rate_before_by_class',
+        'reference_correct_rate_after_by_class',
+        'accept_ref_loss_delta',
+        'reject_ref_loss_delta',
+        'accept_ref_loss_delta_bank',
+        'reject_ref_loss_delta_bank',
+    }
+    string_scalar_keys = {
+        'tta_mode',
+        'perturbation_config_id',
+        'perturbation_response',
+        'perturbation_kind',
+        'perturbation_cache_policy',
+        'probe_config_id',
+        'accept_probe_type',
+        'reject_probe_type',
+        'primary_accept_branch_id',
+        'primary_reject_branch_id',
+        'anchor_loss_type',
+    }
+    for key in RESPONSE_CACHE_SCALAR_KEYS + RESPONSE_CACHE_ARRAY_KEYS:
+        value = scores[key]
+        if key in int_keys:
+            payload[key] = value.astype(np.int64)
+        elif key in float32_keys:
+            payload[key] = value.astype(np.float32)
+        elif key in string_scalar_keys:
+            payload[key] = np.asarray(value)
+        else:
+            payload[key] = value.astype(np.float64)
+    for key in PROBE_RESPONSE_SCALAR_KEYS + PROBE_RESPONSE_ARRAY_KEYS:
+        if key not in scores:
+            continue
+        value = scores[key]
+        if key in int_keys:
+            payload[key] = value.astype(np.int64)
+        elif key in float32_keys:
+            payload[key] = value.astype(np.float32)
+        elif key in string_scalar_keys:
+            payload[key] = np.asarray(value)
+        else:
+            payload[key] = value.astype(np.float64)
+    for key in RESPONSE_CACHE_CONFIG_KEYS + PROBE_RESPONSE_CONFIG_KEYS:
+        if key in scores:
+            payload[key] = np.asarray(scores[key])
+    np.savez_compressed(path, **payload)
 
 
 RESPONSE_CACHE_SCALAR_KEYS = [
@@ -621,6 +802,82 @@ RESPONSE_CACHE_ARRAY_KEYS = [
     'reference_correct_rate_after_by_class',
 ]
 
+RESPONSE_CACHE_CONFIG_KEYS = [
+    'tta_mode',
+    'response_steps',
+    'perturbation_config_id',
+    'perturbation_response',
+    'perturbation_kind',
+    'perturbation_cache_policy',
+    'perturbation_eps_config',
+    'perturbation_repeats_config',
+    'perturbation_seed_config',
+]
+
+PROBE_RESPONSE_SCALAR_KEYS = [
+    'use_accept_reject_probe',
+    'use_anchor_reference',
+    'anchor_weight',
+    'probe_schema_version',
+    'accept_target_objective_delta',
+    'reject_target_objective_delta',
+    'reject_target_entropy_delta',
+    'accept_target_objective_delta_bank',
+    'reject_target_objective_delta_bank',
+    'reject_target_entropy_delta_bank',
+]
+
+PROBE_RESPONSE_ARRAY_KEYS = [
+    'accept_ref_loss_delta',
+    'reject_ref_loss_delta',
+    'accept_ref_loss_delta_bank',
+    'reject_ref_loss_delta_bank',
+]
+
+PROBE_RESPONSE_CONFIG_KEYS = [
+    'probe_config_id',
+    'accept_probe_type',
+    'reject_probe_type',
+    'accept_branch_ids',
+    'accept_branch_probe_types',
+    'reject_branch_ids',
+    'reject_branch_probe_types',
+    'primary_accept_branch_id',
+    'primary_reject_branch_id',
+    'response_bank_schema_version',
+    'anchor_loss_type',
+    'probe_score_rules',
+    'probe_score_rule_arg',
+]
+
+
+def probe_response_config_metadata(args):
+    metadata = {
+        'probe_config_id': probe_config_id(args),
+        'accept_probe_type': args.accept_probe_type,
+        'reject_probe_type': args.reject_probe_type,
+        'anchor_loss_type': args.anchor_loss_type,
+    }
+    if getattr(args, 'use_response_bank', False):
+        metadata.update({
+            'accept_branch_ids':
+            np.asarray(args.accept_branch_ids, dtype='<U64'),
+            'accept_branch_probe_types':
+            np.asarray(args.accept_probe_type_bank, dtype='<U64'),
+            'reject_branch_ids':
+            np.asarray(args.reject_branch_ids, dtype='<U64'),
+            'reject_branch_probe_types':
+            np.asarray(args.reject_probe_type_bank, dtype='<U64'),
+            'primary_accept_branch_id': args.primary_accept_branch_id,
+            'primary_reject_branch_id': args.primary_reject_branch_id,
+            'response_bank_schema_version': 1,
+        })
+    if args.use_accept_reject_probe:
+        metadata['probe_score_rules'] = np.asarray(
+            selected_probe_score_rules('probe_all'))
+        metadata['probe_score_rule_arg'] = 'probe_all'
+    return metadata
+
 
 def empty_tta_response_lists():
     return {
@@ -645,15 +902,27 @@ def tta_response_scores_from_lists(cache_lists, pred_array, label_array,
         'post_tta_pred',
         'adapted_target_pred',
         'target_pred_changed',
+        'use_accept_reject_probe',
+        'use_anchor_reference',
+        'probe_schema_version',
     }
     for key in RESPONSE_CACHE_SCALAR_KEYS:
         dtype = np.int64 if key in int_scalar_keys else np.float64
         scores[key] = np.asarray(cache_lists[key], dtype=dtype)
     for key in RESPONSE_CACHE_ARRAY_KEYS:
         scores[key] = np.stack(cache_lists[key])
+    for key in PROBE_RESPONSE_SCALAR_KEYS:
+        if key in cache_lists and cache_lists[key]:
+            dtype = np.int64 if key in int_scalar_keys else np.float64
+            scores[key] = np.asarray(cache_lists[key], dtype=dtype)
+    for key in PROBE_RESPONSE_ARRAY_KEYS:
+        if key in cache_lists and cache_lists[key]:
+            scores[key] = np.stack(cache_lists[key])
     scores.update({
         'args_score_rule': args.score_rule,
         'reference_config_id': reference_config_id,
+        'tta_mode': args.tta_mode,
+        'response_steps': np.asarray(args.response_steps, dtype=np.int64),
         'perturbation_config_id': perturbation_config_id(args),
         'perturbation_response': args.perturbation_response,
         'perturbation_kind': args.perturbation_kind,
@@ -662,6 +931,7 @@ def tta_response_scores_from_lists(cache_lists, pred_array, label_array,
         'perturbation_repeats_config': int(args.perturbation_repeats),
         'perturbation_seed_config': int(args.perturbation_seed),
     })
+    scores.update(probe_response_config_metadata(args))
     return scores
 
 
@@ -700,6 +970,10 @@ class TTAResponseShardWriter:
                 'cache_schema_version': CACHE_SCHEMA_VERSION,
                 'dataset_name': self.dataset_name,
                 'reference_config_id': self.reference_config_id,
+                'score_rule_arg': args.score_rule,
+                'expanded_score_rules': selected_score_rules(args.score_rule),
+                'probe_config': probe_config_dict(args),
+                'response_steps': list(args.response_steps),
                 'shard_size': self.shard_size,
                 'num_samples': 0,
                 'num_shards': 0,
@@ -712,6 +986,9 @@ class TTAResponseShardWriter:
         self.label_buffer.append(int(label))
         for key in RESPONSE_CACHE_SCALAR_KEYS + RESPONSE_CACHE_ARRAY_KEYS:
             self.buffer[key].append(cache[key])
+        for key in PROBE_RESPONSE_SCALAR_KEYS + PROBE_RESPONSE_ARRAY_KEYS:
+            if key in cache:
+                self.buffer.setdefault(key, []).append(cache[key])
         if len(self.pred_buffer) >= self.shard_size:
             self.flush()
 
@@ -753,6 +1030,10 @@ class TTAResponseShardWriter:
                 'cache_schema_version': CACHE_SCHEMA_VERSION,
                 'dataset_name': self.dataset_name,
                 'reference_config_id': self.reference_config_id,
+                'score_rule_arg': self.args.score_rule,
+                'expanded_score_rules': selected_score_rules(self.args.score_rule),
+                'probe_config': probe_config_dict(self.args),
+                'response_steps': list(self.args.response_steps),
                 'shard_size': self.shard_size,
                 'num_samples': int(self.num_samples),
                 'num_shards': len(self.shards),
@@ -845,6 +1126,13 @@ def reference_set_root(args):
     if root:
         return Path(root)
     return Path(args.output_root) / 'reference_sets'
+
+
+def anchor_set_root(args):
+    root = args.anchor_set_root
+    if root:
+        return Path(root)
+    return Path(args.output_root) / 'anchor_sets'
 
 
 def train_candidate_batch_size(args):
@@ -982,6 +1270,7 @@ def _load_reference_set_manifest(path):
 
 
 REFERENCE_SET_FILE = 'reference_set.npz'
+ANCHOR_SET_FILE = 'anchor_set.npz'
 
 
 def _reference_set_matches(response_dir, identity):
@@ -1001,6 +1290,31 @@ def load_reference_set(response_dir, identity):
     return {
         'metadata_dir': response_dir,
         'reference_set_path': response_dir / REFERENCE_SET_FILE,
+        'manifest_path': response_dir / 'manifest.json',
+        'manifest': _load_reference_set_manifest(response_dir / 'manifest.json'),
+        'identity': identity,
+        'bank': bank,
+        'reused': True,
+    }
+
+
+def _anchor_set_matches(response_dir, identity):
+    manifest = _load_reference_set_manifest(response_dir / 'manifest.json')
+    if not manifest:
+        return False
+    if manifest.get('identity') != identity:
+        return False
+    return (response_dir / ANCHOR_SET_FILE).exists()
+
+
+def load_anchor_set(response_dir, identity):
+    if not _anchor_set_matches(response_dir, identity):
+        return None
+    with np.load(response_dir / ANCHOR_SET_FILE, allow_pickle=False) as data:
+        bank = {key: data[key] for key in data.files}
+    return {
+        'metadata_dir': response_dir,
+        'anchor_set_path': response_dir / ANCHOR_SET_FILE,
         'manifest_path': response_dir / 'manifest.json',
         'manifest': _load_reference_set_manifest(response_dir / 'manifest.json'),
         'identity': identity,
@@ -1466,6 +1780,10 @@ def reference_set_info(postprocessor):
     return json_safe(getattr(postprocessor, 'reference_set_records', {}))
 
 
+def anchor_set_info(postprocessor):
+    return json_safe(getattr(postprocessor, 'anchor_set_records', {}))
+
+
 def timing_info(postprocessor):
     timing = dict(getattr(postprocessor, 'timing', {}))
     processed = int(timing.get('processed_count') or 0)
@@ -1719,7 +2037,7 @@ def output_metrics_path(reference_dir_path, args, score_rule):
 
 
 def output_debug_path(reference_dir_path, args):
-    if args.score_rule == 'all':
+    if args.score_rule in {'all', 'probe_all'}:
         return reference_dir_path / 'score_results' / 'debug_samples_all_scores.csv'
     return reference_dir_path / 'score_results' / 'debug_samples.csv'
 
@@ -1735,6 +2053,8 @@ class TARRPostprocessor(BasePostprocessor):
         self.reference_configs = parse_reference_configs(args)
         self.reference_sets = {}
         self.reference_set_records = {}
+        self.anchor_sets = {}
+        self.anchor_set_records = {}
         self.base_state = None
         self.fc_state = None
         self.base_restore_pairs = None
@@ -1751,12 +2071,15 @@ class TARRPostprocessor(BasePostprocessor):
         self.trainable_params = None
         self.optimizer = None
         self.reference_stats = {}
+        self.anchor_stats = {}
         self.train_candidate_metadata = None
         self.timing = {
             'train_candidate_metadata_sec': 0.0,
             'reference_set_sec': 0.0,
             'reference_set_build_sec': 0.0,
             'reference_set_reuse_sec': 0.0,
+            'anchor_set_sec': 0.0,
+            'anchor_set_reuse_sec': 0.0,
             'setup_total_sec': 0.0,
             'inference_total_sec': 0.0,
             'processed_count': 0,
@@ -1767,6 +2090,7 @@ class TARRPostprocessor(BasePostprocessor):
         }
         self.sample_debug = []
         self.debug_output_mode = args.debug_output_mode
+        self.response_steps = list(args.response_steps)
         self.perturbation_generators = {}
         self.score_rules = selected_score_rules(args.score_rule)
         self.skip_view_clean_logits = (
@@ -1825,6 +2149,13 @@ class TARRPostprocessor(BasePostprocessor):
             self.classifier, self.fc_state)
         self.reference_sets = {}
         self.reference_set_records = {}
+        self.anchor_sets = {}
+        self.anchor_set_records = {}
+        self.train_candidate_metadata = None
+        if self.args.use_anchor_reference and not self.args.use_prebuilt_reference_set:
+            raise ValueError(
+                '--use-anchor-reference requires --use-prebuilt-reference-set '
+                'so Probe P and Anchor A artifacts are explicit and disjoint.')
         if self.args.use_prebuilt_reference_set:
             if self.runtime_mode != 'classifier_feature_cache':
                 raise ValueError(
@@ -1832,11 +2163,32 @@ class TARRPostprocessor(BasePostprocessor):
                     'classifier_feature_cache runtime because canonical '
                     'reference_set artifacts store classifier features, not '
                     'reference images.')
+            expected_candidate_identity = train_candidate_metadata_identity(
+                self.args,
+                id_loader_dict['train'],
+                resolved_checkpoint(self.args),
+            )
             for config in self.reference_configs:
                 bank_start = time.perf_counter()
                 bank, record = self._load_prebuilt_reference_set(config)
+                self._validate_prebuilt_reference_set_identity(
+                    config,
+                    record,
+                    expected_candidate_identity,
+                )
                 self._register_reference_bank(config, bank, True, record,
                                               bank_start)
+                if self.args.use_anchor_reference:
+                    anchor_start = time.perf_counter()
+                    anchor_bank, anchor_record = self._load_prebuilt_anchor_set(
+                        config, record)
+                    self._validate_prebuilt_anchor_set_identity(
+                        config,
+                        record,
+                        anchor_record,
+                    )
+                    self._register_anchor_bank(config, anchor_bank,
+                                               anchor_record, anchor_start)
             if self.args.update_scope == 'classifier':
                 self.trainable_params = self._set_trainable_parameters(net)
                 if self.tta_update_impl == 'reused_torch_optimizer':
@@ -1845,6 +2197,10 @@ class TARRPostprocessor(BasePostprocessor):
             self.reference_stats = {
                 config_id: bank['stats']
                 for config_id, bank in self.reference_sets.items()
+            }
+            self.anchor_stats = {
+                config_id: bank['stats']
+                for config_id, bank in self.anchor_sets.items()
             }
             self.timing['setup_total_sec'] += time.perf_counter() - setup_start
             return
@@ -1968,6 +2324,17 @@ class TARRPostprocessor(BasePostprocessor):
         else:
             self.timing['reference_set_build_sec'] += bank_elapsed
 
+    def _register_anchor_bank(self, config, bank, anchor_set_record, bank_start):
+        self.anchor_sets[config.id] = bank
+        bank_elapsed = time.perf_counter() - bank_start
+        set_info = self.anchor_set_records.setdefault(config.id, {})
+        if anchor_set_record:
+            set_info.update(json_safe(anchor_set_record))
+        set_info['elapsed_sec'] = bank_elapsed
+        set_info['reused'] = True
+        self.timing['anchor_set_sec'] += bank_elapsed
+        self.timing['anchor_set_reuse_sec'] += bank_elapsed
+
     def _find_prebuilt_reference_set_dir(self, config):
         root = (reference_set_root(self.args) / self.args.dataset / config.id /
                 f'seed{config.seed}')
@@ -2004,6 +2371,145 @@ class TARRPostprocessor(BasePostprocessor):
                 f'Ambiguous reference_set for {config.id}; pass a unique '
                 f'config/seed or remove stale artifacts:\n{candidates}')
         return matches[0]
+
+    def _find_prebuilt_anchor_set_dir(self, config, probe_reference_set_id):
+        root = (anchor_set_root(self.args) / self.args.dataset / config.id /
+                f'seed{config.seed}')
+        if not root.exists():
+            raise FileNotFoundError(
+                f'anchor_set directory not found for {config.id}: {root}')
+        matches = []
+        for manifest_path in sorted(root.glob('*/manifest.json')):
+            try:
+                with manifest_path.open() as f:
+                    manifest = json.load(f)
+            except json.JSONDecodeError:
+                continue
+            identity = manifest.get('identity') or {}
+            ref_config = identity.get('reference_config') or manifest.get(
+                'reference_config') or {}
+            if ref_config.get('id') != config.id:
+                continue
+            if int(ref_config.get('per_class', config.per_class)) != int(
+                    config.per_class):
+                continue
+            if ref_config.get('filter', config.filter) != config.filter:
+                continue
+            if int(ref_config.get('seed', config.seed)) != int(config.seed):
+                continue
+            if manifest.get('probe_reference_set_id') != probe_reference_set_id:
+                continue
+            if not manifest.get('anchor_probe_disjoint', False):
+                continue
+            matches.append((manifest_path.parent, manifest))
+        if not matches:
+            raise FileNotFoundError(
+                f'No matching prebuilt anchor_set found for {config.id} '
+                f'and probe_reference_set_id={probe_reference_set_id} under '
+                f'{root}. Build it with reference.py build-anchor-set.')
+        if len(matches) > 1:
+            candidates = '\n'.join(str(path) for path, _ in matches)
+            raise RuntimeError(
+                f'Ambiguous anchor_set for {config.id}; remove stale artifacts:\n'
+                f'{candidates}')
+        return matches[0]
+
+    def _metadata_record_from_prebuilt_reference_set(
+            self, reference_identity, expected_candidate_identity):
+        candidate_info = reference_identity.get('train_candidate_metadata') or {}
+        candidate_identity = candidate_info.get('identity')
+        candidate_id = candidate_info.get('candidate_id')
+        expected_candidate_id = train_candidate_metadata_id(
+            expected_candidate_identity)
+        if candidate_identity != expected_candidate_identity:
+            raise ValueError(
+                'prebuilt reference_set was built from a different '
+                'train_candidate_metadata identity than the current run.')
+        if candidate_id != expected_candidate_id:
+            raise ValueError(
+                'prebuilt reference_set train_candidate_metadata id mismatch: '
+                f'expected {expected_candidate_id}, got {candidate_id}')
+        metadata_dir = (train_candidate_metadata_root(self.args) /
+                        self.args.dataset / expected_candidate_id)
+        manifest_path = metadata_dir / 'manifest.json'
+        metadata_path = metadata_dir / 'candidates.npz'
+        if not manifest_path.exists() or not metadata_path.exists():
+            raise FileNotFoundError(
+                'prebuilt reference_set points to missing '
+                f'train_candidate_metadata artifact: {metadata_dir}')
+        manifest = _load_train_candidate_metadata_manifest(manifest_path)
+        if manifest is None or manifest.get('identity') != expected_candidate_identity:
+            raise ValueError(
+                'train_candidate_metadata manifest does not match the current '
+                f'run identity: {manifest_path}')
+        return {
+            'metadata_dir': metadata_dir,
+            'metadata_path': metadata_path,
+            'manifest_path': manifest_path,
+            'identity': expected_candidate_identity,
+            'candidate_id': expected_candidate_id,
+            'manifest': manifest,
+            'reused': True,
+            'source': 'prebuilt_reference_set',
+        }
+
+    def _validate_prebuilt_reference_set_identity(
+            self, config, record, expected_candidate_identity):
+        identity = record.get('identity') or {}
+        if identity.get('dataset') != self.args.dataset:
+            raise ValueError(
+                f'prebuilt reference_set dataset mismatch for {config.id}: '
+                f'{identity.get("dataset")} != {self.args.dataset}')
+        expected_checkpoint = str(Path(resolved_checkpoint(self.args)).resolve())
+        if identity.get('checkpoint_resolved') != expected_checkpoint:
+            raise ValueError(
+                f'prebuilt reference_set checkpoint mismatch for {config.id}: '
+                f'{identity.get("checkpoint_resolved")} != {expected_checkpoint}')
+        if identity.get('model_arch') != MODEL_ARCH[self.args.dataset].__name__:
+            raise ValueError(
+                f'prebuilt reference_set model_arch mismatch for {config.id}.')
+        if int(identity.get('num_classes', -1)) != int(self.num_classes):
+            raise ValueError(
+                f'prebuilt reference_set num_classes mismatch for {config.id}.')
+        if identity.get('classifier_layer') != self.classifier_name:
+            raise ValueError(
+                f'prebuilt reference_set classifier layer mismatch for '
+                f'{config.id}: {identity.get("classifier_layer")} != '
+                f'{self.classifier_name}')
+        if identity.get('runtime_mode') != self.runtime_mode:
+            raise ValueError(
+                f'prebuilt reference_set runtime_mode mismatch for {config.id}: '
+                f'{identity.get("runtime_mode")} != {self.runtime_mode}')
+        metadata_record = self._metadata_record_from_prebuilt_reference_set(
+            identity,
+            expected_candidate_identity,
+        )
+        if self.train_candidate_metadata is None:
+            self.train_candidate_metadata = metadata_record
+        elif (self.train_candidate_metadata.get('candidate_id') !=
+              metadata_record.get('candidate_id')):
+            raise ValueError(
+                'prebuilt reference_sets were built from multiple '
+                'train_candidate_metadata artifacts in one run.')
+
+    def _validate_prebuilt_anchor_set_identity(
+            self, config, probe_record, anchor_record):
+        probe_identity = probe_record.get('identity') or {}
+        anchor_identity = anchor_record.get('identity') or {}
+        anchor_manifest = anchor_record.get('manifest') or {}
+        if anchor_identity.get('artifact_type') != 'anchor_set':
+            raise ValueError(f'prebuilt anchor_set artifact_type mismatch for {config.id}.')
+        if (anchor_identity.get('train_candidate_metadata') !=
+                probe_identity.get('train_candidate_metadata')):
+            raise ValueError(
+                f'anchor_set train_candidate_metadata does not match Probe P '
+                f'for {config.id}.')
+        if anchor_manifest.get('probe_reference_set_id') != probe_record.get(
+                'reference_set_id'):
+            raise ValueError(
+                f'anchor_set probe_reference_set_id mismatch for {config.id}.')
+        if not bool(anchor_manifest.get('anchor_probe_disjoint', False)):
+            raise ValueError(f'anchor_set is not marked disjoint for {config.id}.')
 
     def _load_prebuilt_reference_set(self, config):
         response_dir, manifest = self._find_prebuilt_reference_set_dir(config)
@@ -2109,6 +2615,69 @@ class TARRPostprocessor(BasePostprocessor):
             'reference_set_reused': True,
         }
         cache['reference_set_id'] = reference_set_id(identity)
+        cache['reused'] = True
+        cache_info = {key: value for key, value in cache.items() if key != 'bank'}
+        return bank, cache_info
+
+    def _load_prebuilt_anchor_set(self, config, probe_record):
+        probe_reference_set_id = probe_record.get('reference_set_id')
+        response_dir, manifest = self._find_prebuilt_anchor_set_dir(
+            config, probe_reference_set_id)
+        identity = manifest.get('identity')
+        if identity is None:
+            raise ValueError(f'anchor_set manifest missing identity: {response_dir}')
+        cache = load_anchor_set(response_dir, identity)
+        if cache is None:
+            raise ValueError(f'invalid anchor_set artifact: {response_dir}')
+        cached = cache['bank']
+        required = [
+            'features',
+            'labels',
+            'base_reference_loss',
+            'base_reference_confidence',
+            'base_reference_entropy',
+            'base_reference_margin',
+            'base_reference_energy',
+            'base_reference_prediction',
+            'base_reference_correct',
+        ]
+        missing = [key for key in required if key not in cached]
+        if missing:
+            raise ValueError(
+                f'anchor_set artifact is missing required field(s): '
+                f'{", ".join(missing)} ({response_dir})')
+        device = torch.device('cuda')
+        labels = torch.as_tensor(cached['labels'], device=device, dtype=torch.long)
+        features = torch.as_tensor(cached['features'], device=device)
+        with torch.no_grad():
+            if isinstance(self.classifier, torch.nn.Linear):
+                teacher_logits = F.linear(
+                    features, self.classifier.weight, self.classifier.bias)
+            else:
+                teacher_logits = self.classifier(features)
+            teacher_probs = torch.softmax(teacher_logits, dim=1).detach()
+        bank = {
+            'config': config,
+            'label': labels,
+            'features': features,
+            'teacher_probs': teacher_probs,
+            'selected_reference_hash': str(np.asarray(
+                cached.get('selected_reference_hash', '')).item()),
+            'stats': {
+                'num_anchor': int(labels.numel()),
+                'per_class_counts': [
+                    int((labels == i).sum().item())
+                    for i in range(self.num_classes)
+                ],
+                'selected_anchor_hash': str(np.asarray(
+                    cached.get('selected_reference_hash', '')).item()),
+                'probe_reference_set_id': probe_reference_set_id,
+                'anchor_probe_disjoint': bool(
+                    manifest.get('anchor_probe_disjoint', False)),
+            },
+        }
+        cache['anchor_set_id'] = manifest.get(
+            'anchor_set_id', reference_set_id(identity))
         cache['reused'] = True
         cache_info = {key: value for key, value in cache.items() if key != 'bank'}
         return bank, cache_info
@@ -2692,42 +3261,172 @@ class TARRPostprocessor(BasePostprocessor):
             for score_rule in self.score_rules
         }
 
-    def score_one(self, net, data):
-        self._restore_base(net)
-        start_time = time.perf_counter()
+    def _classifier_logits_from_features(self, features):
+        if isinstance(self.classifier, torch.nn.Linear):
+            return F.linear(features, self.classifier.weight, self.classifier.bias)
+        return self.classifier(features)
 
-        with torch.no_grad():
-            target_feature = None
-            if self.target_feature_cache_enabled:
-                logits0, target_feature = net(data, return_feature=True)
-                target_feature = target_feature.detach()
+    def _target_logits(self, net, data, target_feature):
+        if self.target_feature_cache_enabled and target_feature is not None:
+            return self._classifier_logits_from_features(target_feature)
+        return net(data)
+
+    def _param_regularization_loss(self):
+        if self.args.update_scope == 'classifier':
+            saved = self.fc_state
+            module = self.classifier
+        else:
+            saved = self.base_state
+            module = self.net_for_param_reg
+        loss = None
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            target = saved[name].to(device=param.device, dtype=param.dtype)
+            value = (param - target).pow(2).mean()
+            loss = value if loss is None else loss + value
+        if loss is None:
+            return torch.zeros((), device=next(self.classifier.parameters()).device)
+        return loss
+
+    def _anchor_loss(self, reference_config_id):
+        if not self.args.use_anchor_reference:
+            return 0.0
+        loss_type = self.args.anchor_loss_type
+        if loss_type == 'none':
+            return 0.0
+        if loss_type == 'param_reg':
+            return self._param_regularization_loss()
+        bank = self.anchor_sets[reference_config_id]
+        features = bank['features']
+        labels = bank['label']
+        batch_size = int(self.args.reference_set_batch_size)
+        losses = []
+        for start in range(0, labels.numel(), batch_size):
+            end = start + batch_size
+            logits = self._classifier_logits_from_features(features[start:end])
+            if loss_type == 'ce':
+                losses.append(F.cross_entropy(logits, labels[start:end]))
+            elif loss_type == 'distill':
+                teacher = bank['teacher_probs'][start:end]
+                losses.append(F.kl_div(
+                    F.log_softmax(logits, dim=1),
+                    teacher,
+                    reduction='batchmean',
+                ))
             else:
-                logits0 = net(data)
-            target_diag0 = logit_diagnostics(logits0)
-            probs0 = target_diag0['probs']
-            target_conf, pred = target_diag0['conf'], target_diag0['pred']
+                raise ValueError(f'Unknown anchor loss type: {loss_type}')
+        return torch.stack(losses).mean()
 
-        perturbation_diag = self._perturbation_diagnostics(
-            net, data, logits0, target_diag0, target_feature)
+    def _target_probe_loss(self, net, data, target_feature, logits,
+                           pseudo_label, mode, hypothesis_label=None,
+                           probe_type=None):
+        if mode == 'existing':
+            return self._tta_step_loss(net, data, target_feature, logits,
+                                       pseudo_label)
+        if mode == 'accept':
+            probe_type = probe_type or self.args.accept_probe_type
+            if probe_type == 'predicted_label_ce':
+                return F.cross_entropy(logits, pseudo_label)
+            if probe_type == 'entropy_min':
+                return self._entropy_loss(logits)
+            if probe_type == 'view_consistency':
+                return self._view_consistency_js_loss(net, data, target_feature)
+            raise ValueError(f'Unknown accept probe type: {probe_type}')
+        if mode == 'reject':
+            probe_type = probe_type or self.args.reject_probe_type
+            if probe_type == 'entropy_max':
+                return -self._entropy_loss(logits)
+            if probe_type == 'uniform':
+                uniform = torch.full_like(logits, 1.0 / logits.shape[1])
+                return F.kl_div(
+                    F.log_softmax(logits, dim=1),
+                    uniform,
+                    reduction='batchmean',
+                )
+            if probe_type == 'logit_suppression':
+                return 0.5 * logits.pow(2).mean()
+            raise ValueError(f'Unknown reject probe type: {probe_type}')
+        raise ValueError(f'Unknown probe mode: {mode}')
 
+    def _run_update(self, net, data, target_feature, logits0, pseudo_label,
+                    reference_config_id, mode, hypothesis_label=None,
+                    measure_bank=None, probe_type=None, branch_id=None):
+        self.net_for_param_reg = net
+        trainable = self._set_trainable_parameters(net)
+        optimizer = torch.optim.SGD(trainable, lr=self.args.lr)
+        save_steps = set(self.response_steps)
+        snapshots = []
+        with torch.no_grad():
+            before = float(self._target_probe_loss(
+                net, data, target_feature, logits0, pseudo_label, mode,
+                hypothesis_label, probe_type).detach().cpu().item())
+        for step in range(1, self.args.steps + 1):
+            optimizer.zero_grad(set_to_none=True)
+            if (mode == 'existing' and self.skip_view_clean_logits):
+                logits = None
+            else:
+                logits = self._target_logits(net, data, target_feature)
+            target_loss = self._target_probe_loss(
+                net, data, target_feature, logits, pseudo_label, mode,
+                hypothesis_label, probe_type)
+            anchor_loss = self._anchor_loss(reference_config_id)
+            loss = target_loss + float(self.args.anchor_weight) * anchor_loss
+            loss.backward()
+            optimizer.step()
+            if step in save_steps:
+                net.eval()
+                with torch.no_grad():
+                    post_logits = self._target_logits(net, data, target_feature)
+                    after = float(self._target_probe_loss(
+                        net, data, target_feature, post_logits, pseudo_label, mode,
+                        hypothesis_label, probe_type).detach().cpu().item())
+                snapshots.append({
+                    'step': int(step),
+                    'branch_id': branch_id or '',
+                    'probe_type': probe_type or '',
+                    'before': before,
+                    'after': after,
+                    'post_logits': post_logits.detach(),
+                    'measure': (
+                        self._measure_reference_response(net, measure_bank)
+                        if measure_bank is not None else None),
+                })
+                if not self.args.freeze_bn_stats:
+                    net.train()
+        net.eval()
+        if len(snapshots) != len(self.response_steps):
+            observed = [item['step'] for item in snapshots]
+            raise RuntimeError(
+                f'Missing response step snapshots: expected '
+                f'{self.response_steps}, got {observed}')
+        return snapshots
+
+    def _run_existing_update_with_reference_snapshots(
+            self, net, data, target_feature, logits0, pseudo_label):
+        self.net_for_param_reg = net
         trainable = self._set_trainable_parameters(net)
         optimizer = self._optimizer_for_sample(trainable)
-        pseudo_label = pred.detach()
+        save_steps = set(self.response_steps)
+        snapshots = []
+        measurements_by_reference = {
+            reference_config_id: []
+            for reference_config_id in self.reference_sets
+        }
         with torch.no_grad():
-            target_tta_loss_before = float(self._tta_step_loss(
+            before = float(self._tta_step_loss(
                 net,
                 data,
                 target_feature,
                 logits0,
                 pseudo_label,
             ).detach().cpu().item())
-
-        for _ in range(self.args.steps):
+        for step in range(1, self.args.steps + 1):
             optimizer.zero_grad(set_to_none=True)
             if self.skip_view_clean_logits:
                 logits = None
             elif self.target_feature_cache_enabled:
-                logits = self.classifier(target_feature)
+                logits = self._classifier_logits_from_features(target_feature)
             else:
                 logits = net(data)
             loss = self._tta_step_loss(
@@ -2739,11 +3438,110 @@ class TARRPostprocessor(BasePostprocessor):
             )
             loss.backward()
             optimizer.step()
-
+            if step not in save_steps:
+                continue
+            net.eval()
+            with torch.no_grad():
+                if self.target_feature_cache_enabled:
+                    post_logits = self._classifier_logits_from_features(
+                        target_feature)
+                else:
+                    post_logits = net(data)
+                after = float(self._tta_step_loss(
+                    net,
+                    data,
+                    target_feature,
+                    post_logits,
+                    pseudo_label,
+                ).detach().cpu().item())
+            snapshots.append({
+                'step': int(step),
+                'before': before,
+                'after': after,
+                'post_logits': post_logits.detach(),
+                'measure': None,
+            })
+            for reference_config_id, bank in self.reference_sets.items():
+                measurements_by_reference[reference_config_id].append(
+                    self._measure_reference_response(net, bank))
+            if not self.args.freeze_bn_stats:
+                net.train()
         net.eval()
-        runtime = time.perf_counter() - start_time
-        primary_score_rule = self.score_rules[0]
-        probs0_cpu = probs0.detach().cpu()[0]
+        if len(snapshots) != len(self.response_steps):
+            observed = [item['step'] for item in snapshots]
+            raise RuntimeError(
+                f'Missing response step snapshots: expected '
+                f'{self.response_steps}, got {observed}')
+        return snapshots, measurements_by_reference
+
+    def _measure_reference_response(self, net, bank):
+        adapted_sample_diag = self._reference_sample_diagnostics(net, bank)
+        adapted_class_diag = self._reference_classwise_diagnostics(
+            adapted_sample_diag, bank)
+        adapted_reference_loss = adapted_class_diag['loss']
+        delta = adapted_reference_loss - bank['base_reference_loss']
+        base_class_diag = bank['base_reference_diag']
+        return {
+            'sample_diag': adapted_sample_diag,
+            'class_diag': adapted_class_diag,
+            'adapted_reference_loss': adapted_reference_loss,
+            'delta': delta,
+            'reference_conf_delta':
+            adapted_class_diag['conf'] - base_class_diag['conf'],
+            'reference_entropy_delta':
+            adapted_class_diag['entropy'] - base_class_diag['entropy'],
+            'reference_margin_delta':
+            adapted_class_diag['margin'] - base_class_diag['margin'],
+            'reference_energy_delta':
+            adapted_class_diag['energy'] - base_class_diag['energy'],
+            'reference_pred_changed_rate': self._reference_pred_changed_rate(
+                bank['base_reference_pred'], adapted_sample_diag['prediction'], bank),
+        }
+
+    def _probe_config_cache(self):
+        cache = {
+            'use_accept_reject_probe': int(bool(self.args.use_accept_reject_probe)),
+            'use_anchor_reference': int(bool(self.args.use_anchor_reference)),
+            'anchor_weight': float(self.args.anchor_weight),
+            'probe_schema_version': (
+                2 if getattr(self.args, 'use_response_bank', False)
+                else 1 if self.args.use_accept_reject_probe else 0),
+            'accept_probe_type': self.args.accept_probe_type,
+            'reject_probe_type': self.args.reject_probe_type,
+            'anchor_loss_type': self.args.anchor_loss_type,
+            'probe_config_id': probe_config_id(self.args),
+        }
+        if getattr(self.args, 'use_response_bank', False):
+            cache.update({
+                'accept_branch_ids':
+                np.asarray(self.args.accept_branch_ids, dtype='<U64'),
+                'accept_branch_probe_types':
+                np.asarray(self.args.accept_probe_type_bank, dtype='<U64'),
+                'reject_branch_ids':
+                np.asarray(self.args.reject_branch_ids, dtype='<U64'),
+                'reject_branch_probe_types':
+                np.asarray(self.args.reject_probe_type_bank, dtype='<U64'),
+                'primary_accept_branch_id': self.args.primary_accept_branch_id,
+                'primary_reject_branch_id': self.args.primary_reject_branch_id,
+                'response_bank_schema_version': 1,
+            })
+        return cache
+
+    def _common_target_values(self, net, data):
+        with torch.no_grad():
+            target_feature = None
+            if self.target_feature_cache_enabled:
+                logits0, target_feature = net(data, return_feature=True)
+                target_feature = target_feature.detach()
+            else:
+                logits0 = net(data)
+            target_diag0 = logit_diagnostics(logits0)
+        return logits0, target_feature, target_diag0
+
+    def _target_cache(self, target_diag0, post_logits, pred, probs0,
+                      target_tta_loss_before, target_tta_loss_after,
+                      perturbation_diag):
+        target_conf = target_diag0['conf']
         target_values = torch.stack((
             pred.to(dtype=target_conf.dtype)[0],
             target_conf[0],
@@ -2757,22 +3555,11 @@ class TARRPostprocessor(BasePostprocessor):
         target_margin_float = float(target_values[3].item())
         target_energy_float = float(target_values[4].item())
         with torch.no_grad():
-            if self.target_feature_cache_enabled:
-                post_tta_logits = self.classifier(target_feature)
-            else:
-                post_tta_logits = net(data)
-            post_tta_diag = logit_diagnostics(post_tta_logits)
+            post_tta_diag = logit_diagnostics(post_logits)
             post_tta_probs = post_tta_diag['probs']
             post_tta_conf = post_tta_diag['conf']
             post_tta_pred = post_tta_diag['pred']
             post_tta_probs_cpu = post_tta_probs.detach().cpu()[0]
-            target_tta_loss_after = float(self._tta_step_loss(
-                net,
-                data,
-                target_feature,
-                post_tta_logits,
-                pseudo_label,
-            ).detach().cpu().item())
         post_tta_values = torch.stack((
             post_tta_pred.to(dtype=post_tta_conf.dtype)[0],
             post_tta_conf[0],
@@ -2786,197 +3573,544 @@ class TARRPostprocessor(BasePostprocessor):
         post_tta_margin_float = float(post_tta_values[3].item())
         post_tta_energy_float = float(post_tta_values[4].item())
         post_tta_pseudo_label_prob = float(post_tta_probs_cpu[pred_int].item())
-        target_conf_delta = post_tta_conf_float - target_conf_float
-        target_entropy_delta = post_tta_entropy_float - target_entropy_float
-        target_margin_delta = post_tta_margin_float - target_margin_float
-        target_energy_delta = post_tta_energy_float - target_energy_float
-        target_pred_changed = int(post_tta_pred_int != pred_int)
+        return pred_int, {
+            'y_hat': pred_int,
+            'target_conf': target_conf_float,
+            'target_entropy': target_entropy_float,
+            'target_probs': probs0.detach().cpu()[0].numpy(),
+            'target_margin': target_margin_float,
+            'target_energy': target_energy_float,
+            'perturbation_logit_l2': perturbation_diag['perturbation_logit_l2'],
+            'perturbation_prob_l1': perturbation_diag['perturbation_prob_l1'],
+            'perturbation_conf_delta': perturbation_diag[
+                'perturbation_conf_delta'],
+            'perturbation_entropy_delta': perturbation_diag[
+                'perturbation_entropy_delta'],
+            'perturbation_response_code': perturbation_diag[
+                'perturbation_response_code'],
+            'perturbation_kind_code': perturbation_diag['perturbation_kind_code'],
+            'perturbation_eps': perturbation_diag['perturbation_eps'],
+            'perturbation_repeats': perturbation_diag['perturbation_repeats'],
+            'perturbation_seed': perturbation_diag['perturbation_seed'],
+            'perturbation_cache_policy_code': perturbation_diag[
+                'perturbation_cache_policy_code'],
+            'target_tta_loss_before': target_tta_loss_before,
+            'target_tta_loss_after': target_tta_loss_after,
+            'post_tta_pred': post_tta_pred_int,
+            'post_tta_target_conf': post_tta_conf_float,
+            'post_tta_target_entropy': post_tta_entropy_float,
+            'post_tta_target_probs': post_tta_probs_cpu.numpy(),
+            'post_tta_pseudo_label_prob': post_tta_pseudo_label_prob,
+            'adapted_target_pred': post_tta_pred_int,
+            'adapted_target_conf': post_tta_conf_float,
+            'adapted_target_entropy': post_tta_entropy_float,
+            'adapted_target_margin': post_tta_margin_float,
+            'adapted_target_energy': post_tta_energy_float,
+            'adapted_target_probs': post_tta_probs_cpu.numpy(),
+            'target_conf_delta': post_tta_conf_float - target_conf_float,
+            'target_entropy_delta':
+            post_tta_entropy_float - target_entropy_float,
+            'target_margin_delta': post_tta_margin_float - target_margin_float,
+            'target_energy_delta': post_tta_energy_float - target_energy_float,
+            'target_pred_changed': int(post_tta_pred_int != pred_int),
+        }
 
-        per_reference = {}
-        for reference_config_id, bank in self.reference_sets.items():
-            adapted_sample_diag = self._reference_sample_diagnostics(net, bank)
-            adapted_class_diag = self._reference_classwise_diagnostics(
-                adapted_sample_diag, bank)
-            adapted_reference_loss = adapted_class_diag['loss']
-            delta = adapted_reference_loss - bank['base_reference_loss']
-            base_class_diag = bank['base_reference_diag']
-            reference_conf_delta = (
-                adapted_class_diag['conf'] - base_class_diag['conf'])
-            reference_entropy_delta = (
-                adapted_class_diag['entropy'] - base_class_diag['entropy'])
-            reference_margin_delta = (
-                adapted_class_diag['margin'] - base_class_diag['margin'])
-            reference_energy_delta = (
-                adapted_class_diag['energy'] - base_class_diag['energy'])
-            reference_pred_changed_rate = self._reference_pred_changed_rate(
-                bank['base_reference_pred'], adapted_sample_diag['prediction'], bank)
-            base_loss_diag = bank['base_reference_loss_diag']
-            adapted_loss_diag = vector_diagnostics(adapted_reference_loss)
-            delta_diag = vector_diagnostics(delta)
-            positive_delta_mean = float(delta.clamp(min=0.0).mean().item())
+    def _target_cache_from_snapshots(self, target_diag0, snapshots, pred, probs0,
+                                     perturbation_diag):
+        target_conf = target_diag0['conf']
+        target_values = torch.stack((
+            pred.to(dtype=target_conf.dtype)[0],
+            target_conf[0],
+            target_diag0['entropy'][0],
+            target_diag0['margin'][0],
+            target_diag0['energy'][0],
+        )).detach().cpu()
+        pred_int = int(target_values[0].item())
+        target_conf_float = float(target_values[1].item())
+        target_entropy_float = float(target_values[2].item())
+        target_margin_float = float(target_values[3].item())
+        target_energy_float = float(target_values[4].item())
+
+        post_pred = []
+        post_conf = []
+        post_entropy = []
+        post_margin = []
+        post_energy = []
+        post_probs = []
+        post_pseudo_prob = []
+        loss_after = []
+        pred_changed = []
+        for snapshot in snapshots:
+            post_logits = snapshot['post_logits']
+            with torch.no_grad():
+                post_diag = logit_diagnostics(post_logits)
+                probs = post_diag['probs'].detach().cpu()[0]
+            post_pred_int = int(post_diag['pred'].detach().cpu()[0].item())
+            post_pred.append(post_pred_int)
+            post_conf.append(float(post_diag['conf'].detach().cpu()[0].item()))
+            post_entropy.append(float(post_diag['entropy'].detach().cpu()[0].item()))
+            post_margin.append(float(post_diag['margin'].detach().cpu()[0].item()))
+            post_energy.append(float(post_diag['energy'].detach().cpu()[0].item()))
+            post_probs.append(probs.numpy())
+            post_pseudo_prob.append(float(probs[pred_int].item()))
+            loss_after.append(float(snapshot['after']))
+            pred_changed.append(int(post_pred_int != pred_int))
+
+        post_pred = np.asarray(post_pred, dtype=np.int64)
+        post_conf = np.asarray(post_conf, dtype=np.float64)
+        post_entropy = np.asarray(post_entropy, dtype=np.float64)
+        post_margin = np.asarray(post_margin, dtype=np.float64)
+        post_energy = np.asarray(post_energy, dtype=np.float64)
+        loss_after = np.asarray(loss_after, dtype=np.float64)
+        return pred_int, {
+            'y_hat': pred_int,
+            'target_conf': target_conf_float,
+            'target_entropy': target_entropy_float,
+            'target_probs': probs0.detach().cpu()[0].numpy(),
+            'target_margin': target_margin_float,
+            'target_energy': target_energy_float,
+            'perturbation_logit_l2': perturbation_diag['perturbation_logit_l2'],
+            'perturbation_prob_l1': perturbation_diag['perturbation_prob_l1'],
+            'perturbation_conf_delta': perturbation_diag[
+                'perturbation_conf_delta'],
+            'perturbation_entropy_delta': perturbation_diag[
+                'perturbation_entropy_delta'],
+            'perturbation_response_code': perturbation_diag[
+                'perturbation_response_code'],
+            'perturbation_kind_code': perturbation_diag['perturbation_kind_code'],
+            'perturbation_eps': perturbation_diag['perturbation_eps'],
+            'perturbation_repeats': perturbation_diag['perturbation_repeats'],
+            'perturbation_seed': perturbation_diag['perturbation_seed'],
+            'perturbation_cache_policy_code': perturbation_diag[
+                'perturbation_cache_policy_code'],
+            'target_tta_loss_before': float(snapshots[0]['before']),
+            'target_tta_loss_after': loss_after,
+            'post_tta_pred': post_pred,
+            'post_tta_target_conf': post_conf,
+            'post_tta_target_entropy': post_entropy,
+            'post_tta_target_probs': np.stack(post_probs),
+            'post_tta_pseudo_label_prob': np.asarray(
+                post_pseudo_prob, dtype=np.float64),
+            'adapted_target_pred': post_pred,
+            'adapted_target_conf': post_conf,
+            'adapted_target_entropy': post_entropy,
+            'adapted_target_margin': post_margin,
+            'adapted_target_energy': post_energy,
+            'adapted_target_probs': np.stack(post_probs),
+            'target_conf_delta': post_conf - target_conf_float,
+            'target_entropy_delta': post_entropy - target_entropy_float,
+            'target_margin_delta': post_margin - target_margin_float,
+            'target_energy_delta': post_energy - target_energy_float,
+            'target_pred_changed': np.asarray(pred_changed, dtype=np.int64),
+        }
+
+    def _step_cache_from_measurements(self, measurements):
+        return {
+            'adapted_reference_loss': torch.stack([
+                item['adapted_reference_loss'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'delta': torch.stack([
+                item['delta'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'reference_conf_delta_by_class': torch.stack([
+                item['reference_conf_delta'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'reference_entropy_delta_by_class': torch.stack([
+                item['reference_entropy_delta'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'reference_margin_delta_by_class': torch.stack([
+                item['reference_margin_delta'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'reference_energy_delta_by_class': torch.stack([
+                item['reference_energy_delta'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'reference_pred_changed_rate_by_class': torch.stack([
+                item['reference_pred_changed_rate'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'reference_correct_rate_after_by_class': torch.stack([
+                item['class_diag']['correct_rate'] for item in measurements
+            ]).detach().cpu().numpy(),
+            'adapted_reference_loss_mean': np.asarray([
+                vector_diagnostics(item['adapted_reference_loss'])['mean']
+                for item in measurements
+            ], dtype=np.float64),
+            'adapted_reference_loss_std': np.asarray([
+                vector_diagnostics(item['adapted_reference_loss'])['std']
+                for item in measurements
+            ], dtype=np.float64),
+            'adapted_reference_loss_min': np.asarray([
+                vector_diagnostics(item['adapted_reference_loss'])['min']
+                for item in measurements
+            ], dtype=np.float64),
+            'adapted_reference_loss_max': np.asarray([
+                vector_diagnostics(item['adapted_reference_loss'])['max']
+                for item in measurements
+            ], dtype=np.float64),
+            'reference_delta_mean': np.asarray([
+                vector_diagnostics(item['delta'])['mean']
+                for item in measurements
+            ], dtype=np.float64),
+            'reference_delta_std': np.asarray([
+                vector_diagnostics(item['delta'])['std']
+                for item in measurements
+            ], dtype=np.float64),
+            'reference_delta_min': np.asarray([
+                vector_diagnostics(item['delta'])['min']
+                for item in measurements
+            ], dtype=np.float64),
+            'reference_delta_max': np.asarray([
+                vector_diagnostics(item['delta'])['max']
+                for item in measurements
+            ], dtype=np.float64),
+            'reference_delta_positive_mean': np.asarray([
+                float(item['delta'].clamp(min=0.0).mean().detach().cpu().item())
+                for item in measurements
+            ], dtype=np.float64),
+        }
+
+    def _scores_from_cache_row(self, cache):
+        scores = {}
+        for score_rule in self.score_rules:
+            row_cache = {
+                'response_steps': np.asarray(self.response_steps, dtype=np.int64)
+            }
+            for key, value in cache.items():
+                array = np.asarray(value)
+                if array.ndim == 0:
+                    row_cache[key] = array.reshape(1)
+                else:
+                    row_cache[key] = array.reshape(1, *array.shape)
+            scores[score_rule] = torch.as_tensor(
+                ood_score_from_cache(row_cache, score_rule)[0],
+                device=cache['delta'].device
+                if isinstance(cache.get('delta'), torch.Tensor) else 'cpu',
+                dtype=torch.float32,
+            )
+        return scores
+
+    def _reference_output_from_measurement(self, measure, bank, probs0, pred_int,
+                                           primary_score_rule, runtime,
+                                           target_cache, probe_extra=None,
+                                           step_cache=None):
+        adapted_reference_loss = measure['adapted_reference_loss']
+        delta = measure['delta']
+        adapted_class_diag = measure['class_diag']
+        adapted_sample_diag = measure['sample_diag']
+        base_class_diag = bank['base_reference_diag']
+        base_loss_diag = bank['base_reference_loss_diag']
+        adapted_loss_diag = vector_diagnostics(adapted_reference_loss)
+        delta_diag = vector_diagnostics(delta)
+        positive_delta_mean = float(delta.clamp(min=0.0).mean().item())
+        cache = dict(target_cache)
+        cache.update({
+            'base_reference_loss': bank['base_reference_loss_cpu'],
+            'adapted_reference_loss': adapted_reference_loss.detach().cpu().numpy(),
+            'delta': delta.detach().cpu().numpy(),
+            'reference_conf_delta_by_class':
+            measure['reference_conf_delta'].detach().cpu().numpy(),
+            'reference_entropy_delta_by_class':
+            measure['reference_entropy_delta'].detach().cpu().numpy(),
+            'reference_margin_delta_by_class':
+            measure['reference_margin_delta'].detach().cpu().numpy(),
+            'reference_energy_delta_by_class':
+            measure['reference_energy_delta'].detach().cpu().numpy(),
+            'reference_pred_changed_rate_by_class':
+            measure['reference_pred_changed_rate'].detach().cpu().numpy(),
+            'reference_correct_rate_before_by_class':
+            bank['base_reference_correct_rate_cpu'],
+            'reference_correct_rate_after_by_class':
+            adapted_class_diag['correct_rate'].detach().cpu().numpy(),
+            'base_reference_loss_mean': base_loss_diag['mean'],
+            'base_reference_loss_std': base_loss_diag['std'],
+            'base_reference_loss_min': base_loss_diag['min'],
+            'base_reference_loss_max': base_loss_diag['max'],
+            'adapted_reference_loss_mean': adapted_loss_diag['mean'],
+            'adapted_reference_loss_std': adapted_loss_diag['std'],
+            'adapted_reference_loss_min': adapted_loss_diag['min'],
+            'adapted_reference_loss_max': adapted_loss_diag['max'],
+            'reference_delta_mean': delta_diag['mean'],
+            'reference_delta_std': delta_diag['std'],
+            'reference_delta_min': delta_diag['min'],
+            'reference_delta_max': delta_diag['max'],
+            'reference_delta_positive_mean': positive_delta_mean,
+            'runtime_per_sample': runtime,
+        })
+        if step_cache:
+            cache.update(step_cache)
+        if probe_extra:
+            cache.update(probe_extra)
+        if any(score_rule in PROBE_SCORE_RULES for score_rule in self.score_rules):
+            ood_scores = self._scores_from_cache_row(cache)
+        else:
             ood_scores = self._scores_from_delta(delta, probs0.detach(), pred_int)
-            primary_ood_score = float(
-                ood_scores[primary_score_rule].detach().cpu().item())
+        primary_ood_score = float(
+            ood_scores[primary_score_rule].detach().cpu().item())
+        return {
+            'primary_ood_score': primary_ood_score,
+            'ood_scores': ood_scores,
+            'cache': cache,
+            'debug_core': {
+                'ood_score': primary_ood_score,
+                'id_confidence': -primary_ood_score,
+                'base_reference_loss_mean': base_loss_diag['mean'],
+                'base_reference_loss_std': base_loss_diag['std'],
+                'base_reference_loss_min': base_loss_diag['min'],
+                'base_reference_loss_max': base_loss_diag['max'],
+                'adapted_reference_loss_mean': adapted_loss_diag['mean'],
+                'adapted_reference_loss_std': adapted_loss_diag['std'],
+                'adapted_reference_loss_min': adapted_loss_diag['min'],
+                'adapted_reference_loss_max': adapted_loss_diag['max'],
+                'reference_delta_mean': delta_diag['mean'],
+                'reference_delta_std': delta_diag['std'],
+                'reference_delta_min': delta_diag['min'],
+                'reference_delta_max': delta_diag['max'],
+                'reference_delta_positive_mean': positive_delta_mean,
+                'reference_correct_rate_before_by_class':
+                bank['base_reference_correct_rate_list'],
+                'reference_correct_rate_after_by_class':
+                adapted_class_diag['correct_rate'].detach().cpu().tolist(),
+            },
+        }
+
+    def _score_one_anchor_or_probe(self, net, data):
+        start_time = time.perf_counter()
+        self._restore_base(net)
+        logits0, target_feature, target_diag0 = self._common_target_values(net, data)
+        probs0 = target_diag0['probs']
+        pred = target_diag0['pred']
+        pseudo_label = pred.detach()
+        pred_int = int(pred.detach().cpu().view(-1)[0].item())
+        perturbation_diag = self._perturbation_diagnostics(
+            net, data, logits0, target_diag0, target_feature)
+        primary_score_rule = self.score_rules[0]
+        per_reference = {}
+
+        for reference_config_id, bank in self.reference_sets.items():
+            if self.args.use_accept_reject_probe:
+                accept_results = []
+                for branch_id, probe_type in zip(
+                        self.args.accept_branch_ids,
+                        self.args.accept_probe_type_bank):
+                    self._restore_base(net)
+                    snapshots = self._run_update(
+                        net, data, target_feature, logits0, pseudo_label,
+                        reference_config_id, 'accept', measure_bank=bank,
+                        probe_type=probe_type, branch_id=branch_id)
+                    measurements = [item['measure'] for item in snapshots]
+                    step_cache = self._step_cache_from_measurements(measurements)
+                    target_objective_delta = np.asarray([
+                        float(item['after'] - item['before'])
+                        for item in snapshots
+                    ], dtype=np.float64)
+                    accept_results.append({
+                        'branch_id': branch_id,
+                        'probe_type': probe_type,
+                        'snapshots': snapshots,
+                        'measurements': measurements,
+                        'measure': measurements[-1],
+                        'step_cache': step_cache,
+                        'target_objective_delta': target_objective_delta,
+                    })
+
+                reject_results = []
+                with torch.no_grad():
+                    base_entropy = target_diag0['entropy'][0]
+                for branch_id, probe_type in zip(
+                        self.args.reject_branch_ids,
+                        self.args.reject_probe_type_bank):
+                    self._restore_base(net)
+                    snapshots = self._run_update(
+                        net, data, target_feature, logits0, pseudo_label,
+                        reference_config_id, 'reject', measure_bank=bank,
+                        probe_type=probe_type, branch_id=branch_id)
+                    measurements = [item['measure'] for item in snapshots]
+                    step_cache = self._step_cache_from_measurements(measurements)
+                    target_objective_delta = np.asarray([
+                        float(item['after'] - item['before'])
+                        for item in snapshots
+                    ], dtype=np.float64)
+                    entropy_delta = []
+                    with torch.no_grad():
+                        for item in snapshots:
+                            reject_entropy = logit_diagnostics(
+                                item['post_logits'])['entropy'][0]
+                            entropy_delta.append(float(
+                                (reject_entropy - base_entropy
+                                 ).detach().cpu().item()))
+                    reject_results.append({
+                        'branch_id': branch_id,
+                        'probe_type': probe_type,
+                        'snapshots': snapshots,
+                        'measurements': measurements,
+                        'measure': measurements[-1],
+                        'step_cache': step_cache,
+                        'target_objective_delta': target_objective_delta,
+                        'target_entropy_delta':
+                        np.asarray(entropy_delta, dtype=np.float64),
+                    })
+                self._restore_base(net)
+
+                primary_accept = accept_results[0]
+                primary_reject = reject_results[0]
+                accept_snapshots = primary_accept['snapshots']
+                accept_measure = primary_accept['measure']
+                accept_step_cache = primary_accept['step_cache']
+                accept_target_objective_delta = primary_accept['target_objective_delta']
+                reject_step_cache = primary_reject['step_cache']
+                reject_target_objective_delta = primary_reject['target_objective_delta']
+                reject_target_entropy_delta = primary_reject[
+                    'target_entropy_delta']
+
+                runtime = time.perf_counter() - start_time
+                _, target_cache = self._target_cache_from_snapshots(
+                    target_diag0,
+                    accept_snapshots,
+                    pred,
+                    probs0,
+                    perturbation_diag,
+                )
+                probe_extra = self._probe_config_cache()
+                probe_extra.update({
+                    'accept_ref_loss_delta': accept_step_cache['delta'],
+                    'reject_ref_loss_delta': reject_step_cache['delta'],
+                    'accept_target_objective_delta': accept_target_objective_delta,
+                    'reject_target_objective_delta': reject_target_objective_delta,
+                    'reject_target_entropy_delta': reject_target_entropy_delta,
+                })
+                if getattr(self.args, 'use_response_bank', False):
+                    probe_extra.update({
+                        'accept_ref_loss_delta_bank': np.stack([
+                            item['step_cache']['delta']
+                            for item in accept_results
+                        ], axis=1),
+                        'reject_ref_loss_delta_bank': np.stack([
+                            item['step_cache']['delta']
+                            for item in reject_results
+                        ], axis=1),
+                        'accept_target_objective_delta_bank': np.stack([
+                            item['target_objective_delta'] for item in accept_results
+                        ], axis=1),
+                        'reject_target_objective_delta_bank': np.stack([
+                            item['target_objective_delta'] for item in reject_results
+                        ], axis=1),
+                        'reject_target_entropy_delta_bank': np.stack([
+                            item['target_entropy_delta']
+                            for item in reject_results
+                        ], axis=1),
+                    })
+                output = self._reference_output_from_measurement(
+                    accept_measure, bank, probs0, pred_int, primary_score_rule,
+                    runtime, target_cache, probe_extra,
+                    step_cache=accept_step_cache)
+            else:
+                self._restore_base(net)
+                snapshots = self._run_update(
+                    net, data, target_feature, logits0, pseudo_label,
+                    reference_config_id, 'existing', measure_bank=bank)
+                measurements = [item['measure'] for item in snapshots]
+                measure = measurements[-1]
+                step_cache = self._step_cache_from_measurements(measurements)
+                runtime = time.perf_counter() - start_time
+                _, target_cache = self._target_cache_from_snapshots(
+                    target_diag0,
+                    snapshots,
+                    pred,
+                    probs0,
+                    perturbation_diag,
+                )
+                output = self._reference_output_from_measurement(
+                    measure, bank, probs0, pred_int, primary_score_rule, runtime,
+                    target_cache, self._probe_config_cache(),
+                    step_cache=step_cache)
             debug_row = {
                 'reference_config_id': reference_config_id,
                 'score_rule': self.args.score_rule,
                 'primary_score_rule': primary_score_rule,
-                'ood_score': primary_ood_score,
-                'id_confidence': -primary_ood_score,
                 'pred': pred_int,
                 'y_hat': pred_int,
-                'target_conf': target_conf_float,
-                'target_entropy': target_entropy_float,
-                'perturbation_logit_l2': perturbation_diag[
-                    'perturbation_logit_l2'],
-                'perturbation_prob_l1': perturbation_diag[
-                    'perturbation_prob_l1'],
-                'perturbation_conf_delta': perturbation_diag[
-                    'perturbation_conf_delta'],
-                'perturbation_entropy_delta': perturbation_diag[
-                    'perturbation_entropy_delta'],
-                'perturbation_response_code': perturbation_diag[
-                    'perturbation_response_code'],
-                'perturbation_kind_code': perturbation_diag[
-                    'perturbation_kind_code'],
-                'perturbation_eps': perturbation_diag['perturbation_eps'],
-                'perturbation_repeats': perturbation_diag[
-                    'perturbation_repeats'],
-                'perturbation_seed': perturbation_diag['perturbation_seed'],
-                'perturbation_cache_policy_code': perturbation_diag[
-                    'perturbation_cache_policy_code'],
-                'target_tta_loss_before': target_tta_loss_before,
-                'target_tta_loss_after': target_tta_loss_after,
-                'post_tta_pred': post_tta_pred_int,
-                'post_tta_target_conf': post_tta_conf_float,
-                'post_tta_target_entropy': post_tta_entropy_float,
-                'post_tta_pseudo_label_prob': post_tta_pseudo_label_prob,
-                'adapted_target_pred': post_tta_pred_int,
-                'adapted_target_conf': post_tta_conf_float,
-                'adapted_target_entropy': post_tta_entropy_float,
-                'adapted_target_margin': post_tta_margin_float,
-                'adapted_target_energy': post_tta_energy_float,
-                'target_conf_delta': target_conf_delta,
-                'target_entropy_delta': target_entropy_delta,
-                'target_margin_delta': target_margin_delta,
-                'target_energy_delta': target_energy_delta,
-                'target_pred_changed': target_pred_changed,
-                'reference_conf_delta_by_class': (
-                    reference_conf_delta.detach().cpu().tolist()),
-                'reference_entropy_delta_by_class': (
-                    reference_entropy_delta.detach().cpu().tolist()),
-                'reference_margin_delta_by_class': (
-                    reference_margin_delta.detach().cpu().tolist()),
-                'reference_energy_delta_by_class': (
-                    reference_energy_delta.detach().cpu().tolist()),
-                'reference_pred_changed_rate_by_class': (
-                    reference_pred_changed_rate.detach().cpu().tolist()),
-                'reference_correct_rate_before_by_class': (
-                    bank['base_reference_correct_rate_list']),
-                'reference_correct_rate_after_by_class': (
-                    adapted_class_diag['correct_rate'].detach().cpu().tolist()),
-                'base_reference_loss_mean': base_loss_diag['mean'],
-                'base_reference_loss_std': base_loss_diag['std'],
-                'base_reference_loss_min': base_loss_diag['min'],
-                'base_reference_loss_max': base_loss_diag['max'],
-                'adapted_reference_loss_mean': adapted_loss_diag['mean'],
-                'adapted_reference_loss_std': adapted_loss_diag['std'],
-                'adapted_reference_loss_min': adapted_loss_diag['min'],
-                'adapted_reference_loss_max': adapted_loss_diag['max'],
-                'reference_delta_mean': delta_diag['mean'],
-                'reference_delta_std': delta_diag['std'],
-                'reference_delta_min': delta_diag['min'],
-                'reference_delta_max': delta_diag['max'],
-                'reference_delta_positive_mean': positive_delta_mean,
-                'runtime_per_sample': runtime,
+                'target_conf': float(target_diag0['conf'][0].detach().cpu().item()),
+                'target_entropy': float(
+                    target_diag0['entropy'][0].detach().cpu().item()),
+                'runtime_per_sample': output['cache']['runtime_per_sample'],
             }
-            if self.args.score_rule == 'all':
-                for score_rule in self.score_rules:
-                    rule_ood_score = float(
-                        ood_scores[score_rule].detach().cpu().item())
-                    debug_row[f'ood_score_{score_rule}'] = rule_ood_score
-                    debug_row[f'id_confidence_{score_rule}'] = -rule_ood_score
+            debug_row.update(output['debug_core'])
+            if self.args.score_rule in {'all', 'probe_all'}:
+                for score_rule, score in output['ood_scores'].items():
+                    value = float(score.detach().cpu().item())
+                    debug_row[f'ood_score_{score_rule}'] = value
+                    debug_row[f'id_confidence_{score_rule}'] = -value
             if self.debug_output_mode == 'full':
                 self.sample_debug.append(debug_row)
-
-            cache = {
-                'y_hat': pred_int,
-                'target_conf': target_conf_float,
-                'target_entropy': target_entropy_float,
-                'target_probs': probs0_cpu.numpy(),
-                'target_margin': target_margin_float,
-                'target_energy': target_energy_float,
-                'perturbation_logit_l2': perturbation_diag[
-                    'perturbation_logit_l2'],
-                'perturbation_prob_l1': perturbation_diag[
-                    'perturbation_prob_l1'],
-                'perturbation_conf_delta': perturbation_diag[
-                    'perturbation_conf_delta'],
-                'perturbation_entropy_delta': perturbation_diag[
-                    'perturbation_entropy_delta'],
-                'perturbation_response_code': perturbation_diag[
-                    'perturbation_response_code'],
-                'perturbation_kind_code': perturbation_diag[
-                    'perturbation_kind_code'],
-                'perturbation_eps': perturbation_diag['perturbation_eps'],
-                'perturbation_repeats': perturbation_diag[
-                    'perturbation_repeats'],
-                'perturbation_seed': perturbation_diag['perturbation_seed'],
-                'perturbation_cache_policy_code': perturbation_diag[
-                    'perturbation_cache_policy_code'],
-                'target_tta_loss_before': target_tta_loss_before,
-                'target_tta_loss_after': target_tta_loss_after,
-                'post_tta_pred': post_tta_pred_int,
-                'post_tta_target_conf': post_tta_conf_float,
-                'post_tta_target_entropy': post_tta_entropy_float,
-                'post_tta_target_probs': post_tta_probs_cpu.numpy(),
-                'post_tta_pseudo_label_prob': post_tta_pseudo_label_prob,
-                'adapted_target_pred': post_tta_pred_int,
-                'adapted_target_conf': post_tta_conf_float,
-                'adapted_target_entropy': post_tta_entropy_float,
-                'adapted_target_margin': post_tta_margin_float,
-                'adapted_target_energy': post_tta_energy_float,
-                'adapted_target_probs': post_tta_probs_cpu.numpy(),
-                'target_conf_delta': target_conf_delta,
-                'target_entropy_delta': target_entropy_delta,
-                'target_margin_delta': target_margin_delta,
-                'target_energy_delta': target_energy_delta,
-                'target_pred_changed': target_pred_changed,
-                'base_reference_loss': bank['base_reference_loss_cpu'],
-                'adapted_reference_loss': adapted_reference_loss.detach().cpu().numpy(),
-                'delta': delta.detach().cpu().numpy(),
-                'reference_conf_delta_by_class': (
-                    reference_conf_delta.detach().cpu().numpy()),
-                'reference_entropy_delta_by_class': (
-                    reference_entropy_delta.detach().cpu().numpy()),
-                'reference_margin_delta_by_class': (
-                    reference_margin_delta.detach().cpu().numpy()),
-                'reference_energy_delta_by_class': (
-                    reference_energy_delta.detach().cpu().numpy()),
-                'reference_pred_changed_rate_by_class': (
-                    reference_pred_changed_rate.detach().cpu().numpy()),
-                'reference_correct_rate_before_by_class': (
-                    bank['base_reference_correct_rate_cpu']),
-                'reference_correct_rate_after_by_class': (
-                    adapted_class_diag['correct_rate'].detach().cpu().numpy()),
-                'base_reference_loss_mean': base_loss_diag['mean'],
-                'base_reference_loss_std': base_loss_diag['std'],
-                'base_reference_loss_min': base_loss_diag['min'],
-                'base_reference_loss_max': base_loss_diag['max'],
-                'adapted_reference_loss_mean': adapted_loss_diag['mean'],
-                'adapted_reference_loss_std': adapted_loss_diag['std'],
-                'adapted_reference_loss_min': adapted_loss_diag['min'],
-                'adapted_reference_loss_max': adapted_loss_diag['max'],
-                'reference_delta_mean': delta_diag['mean'],
-                'reference_delta_std': delta_diag['std'],
-                'reference_delta_min': delta_diag['min'],
-                'reference_delta_max': delta_diag['max'],
-                'reference_delta_positive_mean': positive_delta_mean,
-                'runtime_per_sample': runtime,
-            }
             per_reference[reference_config_id] = (
-                {k: v.detach() for k, v in ood_scores.items()},
-                cache,
+                {k: v.detach() for k, v in output['ood_scores'].items()},
+                output['cache'],
+            )
+        self._restore_base(net)
+        return pred.detach(), per_reference
+
+    def score_one(self, net, data):
+        if self.args.use_accept_reject_probe or self.args.use_anchor_reference:
+            return self._score_one_anchor_or_probe(net, data)
+        self._restore_base(net)
+        start_time = time.perf_counter()
+
+        with torch.no_grad():
+            target_feature = None
+            if self.target_feature_cache_enabled:
+                logits0, target_feature = net(data, return_feature=True)
+                target_feature = target_feature.detach()
+            else:
+                logits0 = net(data)
+            target_diag0 = logit_diagnostics(logits0)
+            probs0 = target_diag0['probs']
+            pred = target_diag0['pred']
+
+        perturbation_diag = self._perturbation_diagnostics(
+            net, data, logits0, target_diag0, target_feature)
+
+        pseudo_label = pred.detach()
+        snapshots, measurements_by_reference = (
+            self._run_existing_update_with_reference_snapshots(
+                net, data, target_feature, logits0, pseudo_label))
+        runtime = time.perf_counter() - start_time
+        primary_score_rule = self.score_rules[0]
+        pred_int, target_cache = self._target_cache_from_snapshots(
+            target_diag0,
+            snapshots,
+            pred,
+            probs0,
+            perturbation_diag,
+        )
+
+        per_reference = {}
+        for reference_config_id, bank in self.reference_sets.items():
+            measurements = measurements_by_reference[reference_config_id]
+            measure = measurements[-1]
+            step_cache = self._step_cache_from_measurements(measurements)
+            output = self._reference_output_from_measurement(
+                measure, bank, probs0, pred_int, primary_score_rule, runtime,
+                target_cache, step_cache=step_cache)
+            debug_row = {
+                'reference_config_id': reference_config_id,
+                'score_rule': self.args.score_rule,
+                'primary_score_rule': primary_score_rule,
+                'pred': pred_int,
+                'y_hat': pred_int,
+                'target_conf': target_cache['target_conf'],
+                'target_entropy': target_cache['target_entropy'],
+                'runtime_per_sample': output['cache']['runtime_per_sample'],
+            }
+            debug_row.update(output['debug_core'])
+            if self.args.score_rule == 'all':
+                for score_rule, score in output['ood_scores'].items():
+                    value = float(score.detach().cpu().item())
+                    debug_row[f'ood_score_{score_rule}'] = value
+                    debug_row[f'id_confidence_{score_rule}'] = -value
+            if self.debug_output_mode == 'full':
+                self.sample_debug.append(debug_row)
+            per_reference[reference_config_id] = (
+                {k: v.detach() for k, v in output['ood_scores'].items()},
+                output['cache'],
             )
         return pred.detach(), per_reference
 
@@ -3091,7 +4225,7 @@ class TARRPostprocessor(BasePostprocessor):
                                 pred_int, cache_label, cache)
                         else:
                             for key, value in cache.items():
-                                ref_lists['cache'][key].append(value)
+                                ref_lists['cache'].setdefault(key, []).append(value)
                     runtime = next(iter(per_reference.values()))[1][
                         'runtime_per_sample']
                     self._record_target_runtime(runtime)
@@ -3127,7 +4261,7 @@ class TARRPostprocessor(BasePostprocessor):
             }
             if streaming_cache:
                 continue
-            outputs[reference_config_id].update({
+            output_cache = {
                 'y_hat': np.asarray(cache_lists['y_hat'], dtype=np.int64),
                 'target_conf': np.asarray(cache_lists['target_conf'], dtype=np.float64),
                 'target_entropy': np.asarray(cache_lists['target_entropy'], dtype=np.float64),
@@ -3239,6 +4373,8 @@ class TARRPostprocessor(BasePostprocessor):
                     cache_lists['runtime_per_sample'], dtype=np.float64),
                 'args_score_rule': self.args.score_rule,
                 'reference_config_id': reference_config_id,
+                'tta_mode': self.args.tta_mode,
+                'response_steps': np.asarray(self.args.response_steps, dtype=np.int64),
                 'perturbation_config_id': perturbation_config_id(self.args),
                 'perturbation_response': self.args.perturbation_response,
                 'perturbation_kind': self.args.perturbation_kind,
@@ -3247,7 +4383,21 @@ class TARRPostprocessor(BasePostprocessor):
                 'perturbation_repeats_config': int(
                     self.args.perturbation_repeats),
                 'perturbation_seed_config': int(self.args.perturbation_seed),
-            })
+            }
+            int_optional = {
+                'use_accept_reject_probe',
+                'use_anchor_reference',
+                'probe_schema_version',
+            }
+            for key in PROBE_RESPONSE_SCALAR_KEYS:
+                if key in cache_lists and cache_lists[key]:
+                    dtype = np.int64 if key in int_optional else np.float64
+                    output_cache[key] = np.asarray(cache_lists[key], dtype=dtype)
+            for key in PROBE_RESPONSE_ARRAY_KEYS:
+                if key in cache_lists and cache_lists[key]:
+                    output_cache[key] = np.stack(cache_lists[key])
+            output_cache.update(probe_response_config_metadata(self.args))
+            outputs[reference_config_id].update(output_cache)
         return outputs
 
     def _record_target_runtime(self, runtime):
@@ -3370,7 +4520,7 @@ def is_full_run_args(args):
 
 
 def require_sharded_tta_response_for_large_full_run(args):
-    save_response = args.save_tta_response or args.score_rule == 'all'
+    save_response = args.save_tta_response or args.score_rule in {'all', 'probe_all'}
     if (args.dataset in {'imagenet', 'imagenet200'}
             and is_full_run_args(args)
             and save_response
@@ -3390,7 +4540,58 @@ def scoring_config_dict(args):
         'delta_definition': DELTA_DEFINITION,
         'cache_schema_version': CACHE_SCHEMA_VERSION,
         'conf_boundary_transform': 'conf = -ood_score',
+        'probe_config': probe_config_dict(args),
     }
+
+
+def probe_config_id(args):
+    if args.tta_mode != 'ar_bank' and not args.use_anchor_reference:
+        return 'probe-none_anchor-none'
+    anchor = (
+        f'anchor-{args.anchor_loss_type}_w{args.anchor_weight:g}'
+        if args.use_anchor_reference else 'anchor-none')
+    if args.tta_mode == 'ar_bank':
+        bank_payload = {
+            'accept': list(args.accept_probe_type_bank),
+            'reject': list(args.reject_probe_type_bank),
+            'primary_accept': args.primary_accept_branch_id,
+            'primary_reject': args.primary_reject_branch_id,
+        }
+        digest = hashlib.sha1(
+            json.dumps(bank_payload, sort_keys=True).encode('utf-8')
+        ).hexdigest()[:10]
+        probe = (
+            f'ar-bank-a{len(args.accept_probe_type_bank)}'
+            f'-r{len(args.reject_probe_type_bank)}-{digest}')
+    else:
+        probe = 'ar-none'
+    return f'{probe}_{anchor}'.replace('.', 'p')
+
+
+def probe_config_dict(args):
+    config = {
+        'ablation_type': args.ablation_type,
+        'tta_mode': args.tta_mode,
+        'use_accept_reject_probe': bool(args.use_accept_reject_probe),
+        'use_anchor_reference': bool(args.use_anchor_reference),
+        'anchor_set_root': str(anchor_set_root(args)),
+        'anchor_loss_type': args.anchor_loss_type,
+        'accept_probe_type': args.accept_probe_type,
+        'reject_probe_type': args.reject_probe_type,
+        'anchor_weight': float(args.anchor_weight),
+        'probe_config_id': probe_config_id(args),
+    }
+    if args.tta_mode == 'ar_bank':
+        config.update({
+            'response_bank_schema_version': 1,
+            'accept_branch_ids': list(args.accept_branch_ids),
+            'accept_branch_probe_types': list(args.accept_probe_type_bank),
+            'reject_branch_ids': list(args.reject_branch_ids),
+            'reject_branch_probe_types': list(args.reject_probe_type_bank),
+            'primary_accept_branch_id': args.primary_accept_branch_id,
+            'primary_reject_branch_id': args.primary_reject_branch_id,
+        })
+    return config
 
 
 def protocol_config_id(args):
@@ -3417,9 +4618,11 @@ def artifact_identity_dict(args, checkpoint, postprocessor):
     }
     train_metadata = train_candidate_metadata_info(postprocessor)
     reference_set_records = reference_set_info(postprocessor)
+    anchor_set_records = anchor_set_info(postprocessor)
     return {
         'dataset': args.dataset,
         'baseline_protocol': args.baseline_protocol,
+        'ablation_type': args.ablation_type,
         'checkpoint_resolved': str(Path(checkpoint).resolve()),
         'checkpoint_sha256': file_sha256(checkpoint),
         'model_arch': MODEL_ARCH[args.dataset].__name__,
@@ -3433,6 +4636,9 @@ def artifact_identity_dict(args, checkpoint, postprocessor):
         'train_candidate_metadata_id': train_metadata.get('candidate_id'),
         'train_candidate_metadata_identity': train_metadata.get('identity'),
         'reference_sets': reference_set_records,
+        'anchor_sets': anchor_set_records,
+        'anchor_stats': postprocessor.anchor_stats,
+        'probe_config': probe_config_dict(args),
         'score_direction': SCORE_DIRECTION,
         'delta_definition': DELTA_DEFINITION,
         'cache_schema_version': CACHE_SCHEMA_VERSION,
@@ -3448,7 +4654,7 @@ def evaluate_scheme(args, evaluator, net, postprocessor, output_dir, scheme,
     scheme_dir = output_dir / scheme
     score_rules = selected_score_rules(args.score_rule)
     scheme_debug_start = len(postprocessor.sample_debug)
-    save_response = args.save_tta_response or args.score_rule == 'all'
+    save_response = args.save_tta_response or args.score_rule in {'all', 'probe_all'}
 
     start_debug = len(postprocessor.sample_debug)
     id_response_writers = (
@@ -3631,6 +4837,7 @@ def evaluate_scheme(args, evaluator, net, postprocessor, output_dir, scheme,
     resolved_names = dataset_names_for_scheme(args, evaluator, scheme)
     train_metadata = train_candidate_metadata_info(postprocessor)
     reference_set_records = reference_set_info(postprocessor)
+    anchor_set_records = anchor_set_info(postprocessor)
     timings = timing_info(postprocessor)
     write_json(
         scheme_dir / 'scheme_manifest.json',
@@ -3641,6 +4848,7 @@ def evaluate_scheme(args, evaluator, net, postprocessor, output_dir, scheme,
             'scheme': scheme,
             'fsood_metric_id_side': 'both' if scheme == 'fsood' else None,
             'score_rule_arg': args.score_rule,
+            'ablation_type': args.ablation_type,
             'expanded_score_rules': score_rules,
             'score_direction': SCORE_DIRECTION,
             'delta_definition': DELTA_DEFINITION,
@@ -3668,6 +4876,11 @@ def evaluate_scheme(args, evaluator, net, postprocessor, output_dir, scheme,
             bool(args.rebuild_reference_set),
             'reference_sets': reference_set_records,
             'reference_stats': postprocessor.reference_stats,
+            'anchor_set_root': str(anchor_set_root(args)),
+            'use_anchor_reference': bool(args.use_anchor_reference),
+            'anchor_sets': anchor_set_records,
+            'anchor_stats': postprocessor.anchor_stats,
+            'probe_config': probe_config_dict(args),
             'scoring_config': scoring_config_dict(args),
             'protocol_config': protocol_config_dict(
                 args, resolve_protocol_csid(args.dataset,
@@ -3726,6 +4939,7 @@ def write_run_info(path, args, checkpoint, postprocessor, elapsed, csid_names):
     ]
     train_metadata = train_candidate_metadata_info(postprocessor)
     reference_set_records = reference_set_info(postprocessor)
+    anchor_set_records = anchor_set_info(postprocessor)
     timings = timing_info(postprocessor)
     lines = [
         '# TARR Run',
@@ -3733,6 +4947,7 @@ def write_run_info(path, args, checkpoint, postprocessor, elapsed, csid_names):
         f'- command: {" ".join(sys.argv)}',
         f'- run_id: {args.run_id or default_run_id(args)}',
         f'- experiment_tag: {args.experiment_tag}',
+        f'- ablation_type: {args.ablation_type}',
         f'- output_root: {args.output_root}',
         f'- dataset: {args.dataset}',
         f'- baseline_protocol: {args.baseline_protocol}',
@@ -3757,7 +4972,16 @@ def write_run_info(path, args, checkpoint, postprocessor, elapsed, csid_names):
         f'- rebuild_reference_set: {args.rebuild_reference_set}',
         f'- reference_sets: {json.dumps(reference_set_records, sort_keys=True)}',
         f'- reference_stats: {json.dumps(postprocessor.reference_stats, sort_keys=True)}',
-        f'- objective: {args.objective}',
+        f'- anchor_set_root: {anchor_set_root(args)}',
+        f'- use_anchor_reference: {args.use_anchor_reference}',
+        f'- anchor_sets: {json.dumps(anchor_set_records, sort_keys=True)}',
+        f'- anchor_stats: {json.dumps(postprocessor.anchor_stats, sort_keys=True)}',
+        f'- probe_config_id: {probe_config_id(args)}',
+        f'- probe_config: {json.dumps(probe_config_dict(args), sort_keys=True)}',
+        f'- tta_mode: {args.tta_mode}',
+        f'- normal_objective: {args.objective if args.tta_mode == "normal" else ""}',
+        f'- accept_probe_types: {",".join(args.accept_probe_type_bank)}',
+        f'- reject_probe_types: {",".join(args.reject_probe_type_bank)}',
         f'- steps: {args.steps}',
         f'- lr: {args.lr:g}',
         f'- update_scope: {args.update_scope}',
@@ -3777,7 +5001,7 @@ def write_run_info(path, args, checkpoint, postprocessor, elapsed, csid_names):
         f'- score_direction: {SCORE_DIRECTION}',
         f'- delta_definition: {DELTA_DEFINITION}',
         f'- cache_schema_version: {CACHE_SCHEMA_VERSION}',
-        f'- save_tta_response: {args.save_tta_response or args.score_rule == "all"}',
+        f'- save_tta_response: {args.save_tta_response or args.score_rule in {"all", "probe_all"}}',
         f'- scheme: {args.scheme}',
         '- fsood_metric_id_side: both',
         f'- near_datasets: {args.near_datasets}',
@@ -3854,6 +5078,7 @@ def main():
                    elapsed, csid_names)
     train_metadata = train_candidate_metadata_info(postprocessor)
     reference_set_records = reference_set_info(postprocessor)
+    anchor_set_records = anchor_set_info(postprocessor)
     timings = timing_info(postprocessor)
     write_json(
         output_dir / 'run_manifest.json',
@@ -3861,6 +5086,7 @@ def main():
             'schema_version': 1,
             'command': sys.argv,
             'run_id': run_id,
+            'ablation_type': args.ablation_type,
             'dataset': args.dataset,
             'baseline_protocol': args.baseline_protocol,
             'seed': args.seed,
@@ -3897,6 +5123,11 @@ def main():
             bool(args.rebuild_reference_set),
             'reference_sets': reference_set_records,
             'reference_stats': postprocessor.reference_stats,
+            'anchor_set_root': str(anchor_set_root(args)),
+            'use_anchor_reference': bool(args.use_anchor_reference),
+            'anchor_sets': anchor_set_records,
+            'anchor_stats': postprocessor.anchor_stats,
+            'probe_config': probe_config_dict(args),
             'scoring_config': scoring_config_dict(args),
             'protocol_config': protocol_config_dict(args, csid_names),
             'artifact_identity': artifact_identity_dict(

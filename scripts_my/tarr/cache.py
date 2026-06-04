@@ -28,20 +28,37 @@ from scripts_my.tarr.protocol import (
     supported_dataset_names,
 )
 from scripts_my.tarr.scoring import (
+    BRANCH_BANK_METADATA_CACHE_KEYS,
+    BRANCH_BANK_SAMPLE_CACHE_KEYS,
     CACHE_SCHEMA_VERSION,
     DELTA_DEFINITION,
     PERTURBATION_DEFINITION,
     PERTURBATION_SCORE_DIRECTION,
     PERTURBATION_SCORE_RULE_CHOICES,
+    PROBE_FIELD_ALIASES,
+    PROBE_METADATA_CACHE_KEYS,
+    PROBE_SAMPLE_CACHE_KEYS,
+    PROBE_SCORE_RULES,
     SCORE_DIRECTION,
     SCORE_RULE_CHOICES,
     VECTOR_SCORE_RULE_CHOICES,
+    branch_bank_shape_errors,
+    branch_ids_from_cache,
+    branch_score_rule_roles,
     fit_vector_score_reference,
+    has_branch_bank,
+    materialize_branch_bank,
     ood_score_from_cache,
     perturbation_ood_score_from_cache,
+    probe_ood_score_from_cache,
+    probe_score_rule_has_required_fields,
     selected_perturbation_score_rules,
+    selected_probe_score_rules,
     selected_score_rules,
     selected_vector_score_rules,
+    select_response_step,
+    response_steps_from_cache,
+    validate_branch_bank_shapes,
     vector_ood_score_from_cache,
 )
 
@@ -160,8 +177,17 @@ SAMPLE_CACHE_KEYS = {
     'reference_correct_rate_after_by_class',
     'runtime_per_sample',
 }
+SAMPLE_CACHE_KEYS.update(PROBE_SAMPLE_CACHE_KEYS)
+SAMPLE_CACHE_KEYS.update(BRANCH_BANK_SAMPLE_CACHE_KEYS)
 
-METADATA_CACHE_KEYS = set(REQUIRED_CACHE_KEYS) - SAMPLE_CACHE_KEYS
+METADATA_CACHE_KEYS = (
+    set(REQUIRED_CACHE_KEYS) - SAMPLE_CACHE_KEYS
+) | set(PROBE_METADATA_CACHE_KEYS) | set(BRANCH_BANK_METADATA_CACHE_KEYS) | {
+    'response_steps',
+    'response_step',
+    'selected_accept_branch_id',
+    'selected_reject_branch_id',
+}
 
 
 def selected_datasets(defaults, choice):
@@ -463,7 +489,199 @@ def score_tuple_from_ood(cache, ood_score, label_override=None):
 
 def score_tuple(cache, score_rule, label_override=None):
     return score_tuple_from_ood(
-        cache, raw_ood_scores(cache, score_rule), label_override)
+        cache, raw_ood_scores(cache, score_rule),
+        label_override)
+
+
+def resolve_response_step_values(cache, response_step_arg):
+    steps = response_steps_from_cache(cache)
+    choice = '' if response_step_arg is None else str(response_step_arg).strip()
+    if choice == 'all':
+        if steps.size == 0:
+            return [None]
+        return [int(step) for step in steps.tolist()]
+    if choice in {'', 'final'}:
+        if steps.size == 0:
+            return [None]
+        return [int(steps[-1])]
+    if steps.size == 0:
+        raise ValueError(
+            '--response-step was set, but this single-step cache has no '
+            'response_steps metadata.')
+    step = int(choice)
+    if step not in set(int(value) for value in steps.tolist()):
+        raise ValueError(
+            f'--response-step {step} is not available; saved steps are '
+            f'{steps.tolist()}')
+    return [step]
+
+
+def should_use_response_step_dir(cache, response_step_arg, response_step_values):
+    steps = response_steps_from_cache(cache)
+    choice = '' if response_step_arg is None else str(response_step_arg).strip()
+    if steps.size == 0:
+        return False
+    return (
+        choice not in {'', 'final'}
+        or len(response_step_values) > 1
+        or steps.size > 1
+    )
+
+
+def rule_output_dir(output_dir, score_rule, response_step, use_step_dir):
+    path = Path(output_dir) / score_rule
+    if use_step_dir:
+        path = path / f'step_{int(response_step)}'
+    return path
+
+
+def _selector_is_explicit(selector):
+    return str(selector).strip() not in {'', 'auto'}
+
+
+def _safe_branch_tag(value):
+    text = str(value)
+    safe = []
+    for char in text:
+        if char.isalnum() or char in {'-', '_', '.'}:
+            safe.append(char)
+        else:
+            safe.append('-')
+    tag = ''.join(safe).strip('-._')
+    return tag or 'branch'
+
+
+def _branch_choice_label(choice):
+    if choice is None:
+        return 'primary'
+    return choice['id']
+
+
+def _resolve_branch_token(cache, role, token):
+    ids = branch_ids_from_cache(cache, role)
+    if not ids:
+        raise ValueError(f'No {role} response-bank branches are available')
+    try:
+        index = int(token)
+    except ValueError:
+        matches = [idx for idx, value in enumerate(ids) if value == token]
+        if not matches:
+            raise ValueError(
+                f'Unknown {role} response-bank branch {token!r}; '
+                f'available branches: {ids}')
+        index = matches[0]
+    if index < 0 or index >= len(ids):
+        raise ValueError(
+            f'{role} response-bank branch index {index} out of range; '
+            f'available branches: {ids}')
+    return {'index': index, 'id': ids[index]}
+
+
+def _all_branch_choices(cache, role):
+    ids = branch_ids_from_cache(cache, role)
+    if not ids:
+        raise ValueError(f'No {role} response-bank branches are available')
+    return [{'index': index, 'id': branch_id}
+            for index, branch_id in enumerate(ids)]
+
+
+def resolve_branch_choices(cache, role, selector, needed):
+    choice = 'auto' if selector is None else str(selector).strip()
+    if choice in {'', 'auto'}:
+        if not needed:
+            return [None]
+        if has_branch_bank(cache, role):
+            return _all_branch_choices(cache, role)
+        return [None]
+    if choice == 'legacy':
+        raise ValueError(
+            f'--{role}-branch legacy is no longer supported. Use auto for '
+            'primary singleton fields, or all/a branch name/a branch index '
+            'for response-bank scoring.')
+    if not needed:
+        raise ValueError(
+            f'--{role}-branch was set, but the selected score rule does not '
+            f'use a {role} response-bank branch')
+    if choice == 'all':
+        return _all_branch_choices(cache, role)
+    tokens = [token.strip() for token in choice.split(',') if token.strip()]
+    if not tokens:
+        return [None]
+    return [_resolve_branch_token(cache, role, token) for token in tokens]
+
+
+def validate_branch_choice_compatibility(caches, role, choices):
+    materialized = [choice for choice in choices if choice is not None]
+    if not materialized:
+        return
+    expected_ids = branch_ids_from_cache(caches[0][1], role)
+    for name, cache in caches[1:]:
+        ids = branch_ids_from_cache(cache, role)
+        if ids != expected_ids:
+            raise ValueError(
+                f'{name} {role} response-bank branch ids {ids} != clean ID '
+                f'response-bank branch ids {expected_ids}')
+    for choice in materialized:
+        if choice['id'] != expected_ids[choice['index']]:
+            raise ValueError(
+                f'{role} response-bank branch choice {choice} does not match '
+                f'branch ids {expected_ids}')
+
+
+def branch_variants_for_rule(cache, caches_for_compat, score_rule, args):
+    roles = set(branch_score_rule_roles(score_rule))
+    if not roles:
+        if (_selector_is_explicit(args.accept_branch)
+                or _selector_is_explicit(args.reject_branch)):
+            raise ValueError(
+                f'Score rule {score_rule} does not use response-bank branch '
+                'fields')
+        return [(None, None)]
+
+    accept_choices = resolve_branch_choices(
+        cache, 'accept', args.accept_branch, 'accept' in roles)
+    reject_choices = resolve_branch_choices(
+        cache, 'reject', args.reject_branch, 'reject' in roles)
+    validate_branch_choice_compatibility(
+        caches_for_compat, 'accept', accept_choices)
+    validate_branch_choice_compatibility(
+        caches_for_compat, 'reject', reject_choices)
+
+    if 'accept' in roles and 'reject' in roles:
+        if args.branch_combine == 'zip':
+            if len(accept_choices) != len(reject_choices):
+                raise ValueError(
+                    '--branch-combine zip requires the same number of accept '
+                    'and reject response-bank branches')
+            return list(zip(accept_choices, reject_choices))
+        return [
+            (accept_choice, reject_choice)
+            for accept_choice in accept_choices
+            for reject_choice in reject_choices
+        ]
+    if 'accept' in roles:
+        return [(accept_choice, None) for accept_choice in accept_choices]
+    return [(None, reject_choice) for reject_choice in reject_choices]
+
+
+def branch_variant_dir(base_dir, accept_choice=None, reject_choice=None):
+    parts = []
+    if accept_choice is not None:
+        parts.append(f'accept_{_safe_branch_tag(accept_choice["id"])}')
+    if reject_choice is not None:
+        parts.append(f'reject_{_safe_branch_tag(reject_choice["id"])}')
+    if not parts:
+        return base_dir
+    return Path(base_dir) / '__'.join(parts)
+
+
+def materialize_branch_variant(cache, accept_choice=None, reject_choice=None):
+    accept_index = None if accept_choice is None else accept_choice['index']
+    reject_index = None if reject_choice is None else reject_choice['index']
+    if accept_index is None and reject_index is None:
+        return cache
+    return materialize_branch_bank(
+        cache, accept_branch=accept_index, reject_branch=reject_index)
 
 
 def concat_scores(parts):
@@ -563,7 +781,10 @@ def _validate_score_rules(cache, errors):
     if values.ndim != 1:
         errors.append('score_rules must be a 1-D array')
         return
-    allowed = set(selected_score_rules('all'))
+    allowed = (
+        set(selected_score_rules('all'))
+        | set(selected_score_rules('probe_all'))
+    )
     for value in values:
         score_rule = str(value)
         if score_rule not in allowed:
@@ -595,6 +816,174 @@ def _validate_perturbation_score_rules(cache, errors):
         if score_rule not in allowed:
             errors.append(
                 f'perturbation_score_rules contains unknown rule: {score_rule}')
+
+
+def _validate_probe_score_rules(cache, errors):
+    if 'probe_score_rules' not in cache:
+        return
+    values = np.asarray(cache['probe_score_rules'])
+    if values.ndim != 1:
+        errors.append('probe_score_rules must be a 1-D array')
+        return
+    allowed = set(selected_probe_score_rules('probe_all'))
+    for value in values:
+        score_rule = str(value)
+        if score_rule not in allowed:
+            errors.append(f'probe_score_rules contains unknown rule: {score_rule}')
+    if 'probe_score_rule_arg' in cache:
+        score_rule_arg_value = np.asarray(cache['probe_score_rule_arg'])
+        if score_rule_arg_value.shape != ():
+            errors.append('probe_score_rule_arg must be scalar config metadata')
+            return
+        score_rule_arg = str(score_rule_arg_value.item())
+        try:
+            expected = selected_probe_score_rules(score_rule_arg)
+        except Exception as exc:
+            errors.append(f'probe_score_rule_arg invalid: {exc}')
+            return
+        actual = [str(value) for value in values]
+        if score_rule_arg == 'probe_all':
+            missing_from_current = [
+                score_rule for score_rule in actual
+                if score_rule not in expected
+            ]
+            if missing_from_current:
+                errors.append(
+                    f'probe_score_rules {actual} contains rules not in '
+                    f'current probe_all expansion {expected}')
+        elif actual != expected:
+            errors.append(
+                f'probe_score_rules {actual} != probe_score_rule_arg '
+                f'expansion {expected}')
+
+
+def _numeric_optional_array(cache, key, errors):
+    try:
+        return np.asarray(cache[key], dtype=np.float64)
+    except (TypeError, ValueError):
+        errors.append(f'{key} must be numeric')
+        return None
+
+
+def _validate_optional_probe_fields(cache, n, num_classes, errors, num_steps=0):
+    vector_groups = {
+        'accept_target_objective_delta',
+        'reject_target_objective_delta',
+        'reject_target_entropy_delta',
+    }
+    matrix_groups = {
+        'accept_ref_loss_delta',
+        'reject_ref_loss_delta',
+    }
+
+    for group, aliases in PROBE_FIELD_ALIASES.items():
+        for key in aliases:
+            if key not in cache:
+                continue
+            values = _numeric_optional_array(cache, key, errors)
+            if values is None:
+                continue
+            if group in vector_groups:
+                if values.ndim not in {1, 2}:
+                    errors.append(f'{key} must be a 1-D or 2-D probe array')
+                    continue
+                if values.shape[0] != n:
+                    errors.append(f'{key} first dimension {values.shape[0]} != {n}')
+                if values.ndim == 2 and num_steps and values.shape[1] != num_steps:
+                    errors.append(
+                        f'{key} step dimension {values.shape[1]} != '
+                        f'{num_steps}')
+            elif group in matrix_groups:
+                if values.ndim not in {2, 3}:
+                    errors.append(f'{key} must be a 2-D or 3-D probe array')
+                    continue
+                if values.shape[0] != n:
+                    errors.append(f'{key} first dimension {values.shape[0]} != {n}')
+                class_axis = 1 if values.ndim == 2 else 2
+                if values.shape[class_axis] != num_classes:
+                    errors.append(
+                        f'{key} class dimension {values.shape[class_axis]} != '
+                        f'{num_classes}')
+                if values.ndim == 3 and num_steps and values.shape[1] != num_steps:
+                    errors.append(
+                        f'{key} step dimension {values.shape[1]} != '
+                        f'{num_steps}')
+            if not np.all(np.isfinite(values)):
+                errors.append(f'{key} contains non-finite values')
+
+    for key in [
+            'probe_score_alpha',
+            'probe_score_beta',
+            'probe_score_gamma',
+            'probe_score_temperature',
+            'probe_score_eps',
+    ]:
+        if key not in cache:
+            continue
+        value = _numeric_optional_array(cache, key, errors)
+        if value is None:
+            continue
+        if value.shape != ():
+            errors.append(f'{key} must be scalar config metadata')
+        elif not np.isfinite(value.item()):
+            errors.append(f'{key} must be finite')
+        elif key in {'probe_score_temperature', 'probe_score_eps'}:
+            if float(value.item()) <= 0.0:
+                errors.append(f'{key} must be positive')
+
+
+def _declared_probe_score_rules(cache):
+    rules = []
+    for key in ['score_rules', 'probe_score_rules']:
+        if key not in cache:
+            continue
+        values = np.asarray(cache[key])
+        if values.ndim != 1:
+            continue
+        rules.extend(str(value) for value in values
+                     if str(value) in PROBE_SCORE_RULES)
+    for key, selector in [
+            ('args_score_rule', selected_score_rules),
+            ('probe_score_rule_arg', selected_probe_score_rules),
+    ]:
+        if key not in cache:
+            continue
+        value = np.asarray(cache[key])
+        if value.shape != ():
+            continue
+        try:
+            selected = selector(str(value.item()))
+        except Exception:
+            continue
+        rules.extend(rule for rule in selected if rule in PROBE_SCORE_RULES)
+    seen = set()
+    result = []
+    for rule in PROBE_SCORE_RULES:
+        if rule in rules and rule not in seen:
+            seen.add(rule)
+            result.append(rule)
+    return result
+
+
+def _has_probe_fields(cache):
+    return any(key in cache for key in PROBE_SAMPLE_CACHE_KEYS)
+
+
+def _probe_rules_to_validate(cache):
+    declared = _declared_probe_score_rules(cache)
+    if declared:
+        return declared
+    if not _has_probe_fields(cache):
+        return []
+    rules = []
+    for score_rule in PROBE_SCORE_RULES:
+        try:
+            has_fields = probe_score_rule_has_required_fields(cache, score_rule)
+        except Exception:
+            has_fields = False
+        if has_fields:
+            rules.append(score_rule)
+    return rules
 
 
 def _validate_scalar_config_metadata(cache, errors):
@@ -630,19 +1019,53 @@ def validate_cache(cache):
     base_loss = cache['base_reference_loss']
     adapted_loss = cache['adapted_reference_loss']
     runtime = cache['runtime_per_sample']
+    response_steps = response_steps_from_cache(cache)
+    num_steps = int(response_steps.size)
 
     if pred.ndim != 1 or label.ndim != 1 or y_hat.ndim != 1:
         errors.append('pred, label, and y_hat must be 1-D arrays')
-    if target_probs.ndim != 2 or delta.ndim != 2:
-        errors.append('target_probs and delta must be 2-D arrays')
-    if adapted_target_probs.shape != target_probs.shape:
-        errors.append('adapted_target_probs shape differs from target_probs')
-    if cache['post_tta_target_probs'].shape != target_probs.shape:
-        errors.append('post_tta_target_probs shape differs from target_probs')
-    if base_loss.shape != adapted_loss.shape:
-        errors.append('base/adapted reference loss shapes differ')
-    if target_probs.shape != delta.shape:
-        errors.append('target_probs and delta shapes differ')
+    if target_probs.ndim != 2 or delta.ndim not in {2, 3}:
+        errors.append('target_probs must be 2-D and delta must be 2-D or 3-D')
+    if target_probs.ndim == 2 and delta.ndim in {2, 3}:
+        num_classes = delta.shape[2] if delta.ndim == 3 else delta.shape[1]
+        if target_probs.shape[1] != num_classes:
+            errors.append(
+                f'target_probs class dimension {target_probs.shape[1]} != '
+                f'{num_classes}')
+    else:
+        num_classes = 0
+    if delta.ndim == 3:
+        if num_steps and delta.shape[1] != num_steps:
+            errors.append(
+                f'delta step dimension {delta.shape[1]} != {num_steps}')
+        elif not num_steps:
+            errors.append('step-wise delta requires response_steps metadata')
+        expected_adapted_target_probs_shape = (
+            target_probs.shape[0], delta.shape[1], delta.shape[2])
+        expected_reference_shape = delta.shape
+    elif delta.ndim == 2:
+        expected_adapted_target_probs_shape = target_probs.shape
+        expected_reference_shape = delta.shape
+    else:
+        expected_adapted_target_probs_shape = target_probs.shape
+        expected_reference_shape = delta.shape
+    if adapted_target_probs.shape != expected_adapted_target_probs_shape:
+        errors.append(
+            f'adapted_target_probs shape {adapted_target_probs.shape} != '
+            f'{expected_adapted_target_probs_shape}')
+    post_probs = cache['post_tta_target_probs']
+    if post_probs.shape != expected_adapted_target_probs_shape:
+        errors.append(
+            f'post_tta_target_probs shape {post_probs.shape} != '
+            f'{expected_adapted_target_probs_shape}')
+    if adapted_loss.shape != expected_reference_shape:
+        errors.append(
+            f'adapted_reference_loss shape {adapted_loss.shape} != '
+            f'{expected_reference_shape}')
+    if base_loss.shape != target_probs.shape:
+        errors.append(
+            f'base_reference_loss shape {base_loss.shape} != '
+            f'{target_probs.shape}')
 
     n = pred.shape[0]
     for key, value in [
@@ -713,12 +1136,18 @@ def validate_cache(cache):
         'reference_margin_delta_by_class',
         'reference_energy_delta_by_class',
         'reference_pred_changed_rate_by_class',
-        'reference_correct_rate_before_by_class',
         'reference_correct_rate_after_by_class',
     ]
     for key in by_class_keys:
-        if cache[key].shape != delta.shape:
-            errors.append(f'{key} shape {cache[key].shape} != {delta.shape}')
+        if cache[key].shape != expected_reference_shape:
+            errors.append(
+                f'{key} shape {cache[key].shape} != '
+                f'{expected_reference_shape}')
+    if cache['reference_correct_rate_before_by_class'].shape != target_probs.shape:
+        errors.append(
+            'reference_correct_rate_before_by_class shape '
+            f'{cache["reference_correct_rate_before_by_class"].shape} != '
+            f'{target_probs.shape}')
     finite_keys = [
         'target_conf',
         'target_entropy',
@@ -757,6 +1186,9 @@ def validate_cache(cache):
     for key in finite_keys:
         if not np.all(np.isfinite(cache[key])):
             errors.append(f'{key} contains non-finite values')
+    _validate_optional_probe_fields(cache, n, num_classes, errors, num_steps)
+    errors.extend(branch_bank_shape_errors(
+        cache, n=n, num_steps=num_steps, num_classes=num_classes))
 
     _validate_scalar_int(
         cache, 'cache_schema_version', CACHE_SCHEMA_VERSION, errors)
@@ -772,6 +1204,7 @@ def validate_cache(cache):
     _validate_scalar_config_metadata(cache, errors)
     _validate_score_rules(cache, errors)
     _validate_perturbation_score_rules(cache, errors)
+    _validate_probe_score_rules(cache, errors)
 
     for score_rule in selected_score_rules('all'):
         try:
@@ -784,6 +1217,16 @@ def validate_cache(cache):
     for score_rule in selected_perturbation_score_rules('all'):
         try:
             scores = perturbation_ood_score_from_cache(cache, score_rule)
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            errors.append(f'{score_rule} failed: {exc}')
+            continue
+        if scores.shape[0] != n:
+            errors.append(f'{score_rule} returned {scores.shape[0]} scores')
+        if not np.all(np.isfinite(scores)):
+            errors.append(f'{score_rule} contains non-finite values')
+    for score_rule in _probe_rules_to_validate(cache):
+        try:
+            scores = probe_ood_score_from_cache(cache, score_rule)
         except Exception as exc:  # pragma: no cover - diagnostic path
             errors.append(f'{score_rule} failed: {exc}')
             continue
@@ -1463,96 +1906,171 @@ def score_command(args):
         'far_datasets': far_names,
         'csid_datasets': [name for name, _ in csid_caches],
     }
-    vector_manifest = None
-    if args.vector_score_rule:
-        vector_fit = fit_vector_score_reference(id_cache)
-        vector_manifest = dict(score_manifest)
-        vector_manifest.update({
-            'diagnostic_only': True,
-            'fit_source': 'clean_id_cache',
-            'vector_fit': vector_fit,
+    response_step_values = resolve_response_step_values(
+        id_cache, args.response_step)
+    use_step_dir = should_use_response_step_dir(
+        id_cache, args.response_step, response_step_values)
+    manifest_data = dict(score_manifest)
+    manifest_data.update({
+        'response_step_arg': args.response_step,
+        'response_steps': response_steps_from_cache(id_cache).tolist(),
+        'response_step_values': response_step_values,
+    })
+
+    for response_step in response_step_values:
+        id_cache_step = select_response_step(id_cache, response_step)
+        csid_caches_step = [
+            (name, select_response_step(cache, response_step))
+            for name, cache in csid_caches
+        ]
+        near_caches_step = [
+            (name, select_response_step(cache, response_step))
+            for name, cache in near_caches
+        ]
+        far_caches_step = [
+            (name, select_response_step(cache, response_step))
+            for name, cache in far_caches
+        ]
+        step_manifest = dict(score_manifest)
+        step_manifest.update({
+            'response_step_arg': args.response_step,
+            'response_steps': response_steps_from_cache(id_cache).tolist(),
+            'response_step': response_step,
         })
-        write_json(output_dir / 'vector_fit.json', vector_fit)
-
-    for score_rule in score_rules:
+        vector_manifest = None
         if args.vector_score_rule:
-            id_ood = raw_vector_ood_scores(id_cache, score_rule, vector_fit)
-            id_scores = score_tuple_from_ood(id_cache, id_ood)
-        elif args.perturbation_score_rule:
-            id_ood = raw_perturbation_ood_scores(id_cache, score_rule)
-            id_scores = score_tuple_from_ood(id_cache, id_ood)
-        else:
-            id_scores = score_tuple(id_cache, score_rule)
-        metric_id_scores = id_scores
-        save_npz(output_dir / score_rule / 'scores' / f'{args.dataset}.npz',
-                 id_scores)
+            vector_fit = fit_vector_score_reference(id_cache_step)
+            vector_manifest = dict(step_manifest)
+            vector_manifest.update({
+                'diagnostic_only': True,
+                'fit_source': 'clean_id_cache',
+                'vector_fit': vector_fit,
+            })
+            if not use_step_dir:
+                write_json(output_dir / 'vector_fit.json', vector_fit)
 
-        if csid_caches:
-            csid_score_parts = []
-            for csid_name, csid_cache in csid_caches:
-                if args.vector_score_rule:
-                    csid_ood = raw_vector_ood_scores(
-                        csid_cache, score_rule, vector_fit)
-                    csid_scores = score_tuple_from_ood(csid_cache, csid_ood)
-                elif args.perturbation_score_rule:
-                    csid_ood = raw_perturbation_ood_scores(
-                        csid_cache, score_rule)
-                    csid_scores = score_tuple_from_ood(csid_cache, csid_ood)
-                else:
-                    csid_scores = score_tuple(csid_cache, score_rule)
-                save_npz(output_dir / score_rule / 'scores' /
-                         f'{csid_name}.npz', csid_scores)
-                csid_score_parts.append(csid_scores)
-            if args.fsood_id_side == 'both':
-                metric_id_scores = concat_scores([id_scores] + csid_score_parts)
-            elif args.fsood_id_side == 'csid':
-                metric_id_scores = concat_scores(csid_score_parts)
+        for score_rule in score_rules:
+            compat_caches = (
+                [('clean_id', id_cache_step)]
+                + [(name, cache) for name, cache in csid_caches_step]
+                + [(name, cache) for name, cache in near_caches_step]
+                + [(name, cache) for name, cache in far_caches_step]
+            )
+            if args.vector_score_rule or args.perturbation_score_rule:
+                branch_variants = [(None, None)]
+            else:
+                branch_variants = branch_variants_for_rule(
+                    id_cache_step, compat_caches, score_rule, args)
 
-        rows = []
-        for split_name, split_caches in [
-                ('near', near_caches),
-                ('far', far_caches),
-        ]:
-            split_metrics = []
-            for name, split_cache in split_caches:
-                ood_label = -1 * np.ones_like(split_cache['label'],
-                                              dtype=np.int64)
+            for accept_choice, reject_choice in branch_variants:
+                current_rule_dir = rule_output_dir(
+                    output_dir, score_rule, response_step, use_step_dir)
+                current_rule_dir = branch_variant_dir(
+                    current_rule_dir, accept_choice, reject_choice)
+                id_cache_variant = materialize_branch_variant(
+                    id_cache_step, accept_choice, reject_choice)
                 if args.vector_score_rule:
-                    split_ood = raw_vector_ood_scores(
-                        split_cache, score_rule, vector_fit)
-                    split_scores = score_tuple_from_ood(
-                        split_cache, split_ood, ood_label)
+                    id_ood = raw_vector_ood_scores(
+                        id_cache_variant, score_rule, vector_fit)
+                    id_scores = score_tuple_from_ood(id_cache_variant, id_ood)
                 elif args.perturbation_score_rule:
-                    split_ood = raw_perturbation_ood_scores(
-                        split_cache, score_rule)
-                    split_scores = score_tuple_from_ood(
-                        split_cache, split_ood, ood_label)
+                    id_ood = raw_perturbation_ood_scores(
+                        id_cache_variant, score_rule)
+                    id_scores = score_tuple_from_ood(id_cache_variant, id_ood)
                 else:
-                    split_scores = score_tuple(split_cache, score_rule, ood_label)
-                save_npz(output_dir / score_rule / 'scores' / f'{name}.npz',
-                         split_scores)
-                metrics = metric_summary(metric_id_scores, split_scores)
-                split_metrics.append(metrics)
-                rows.append(format_metric_row(name, metrics))
-            if split_metrics:
-                rows.append(
-                    format_metric_row(f'{split_name}ood',
-                                      np.mean(np.asarray(split_metrics),
-                                              axis=0)))
-        write_metrics_csv(output_dir / score_rule / 'ood.csv', rows)
-        if vector_manifest is not None:
-            write_json(output_dir / score_rule / 'vector_fit.json',
-                       vector_manifest)
+                    id_scores = score_tuple(id_cache_variant, score_rule)
+                metric_id_scores = id_scores
+                save_npz(current_rule_dir / 'scores' / f'{args.dataset}.npz',
+                         id_scores)
+
+                if csid_caches_step:
+                    csid_score_parts = []
+                    for csid_name, csid_cache in csid_caches_step:
+                        csid_cache_variant = materialize_branch_variant(
+                            csid_cache, accept_choice, reject_choice)
+                        if args.vector_score_rule:
+                            csid_ood = raw_vector_ood_scores(
+                                csid_cache_variant, score_rule, vector_fit)
+                            csid_scores = score_tuple_from_ood(
+                                csid_cache_variant, csid_ood)
+                        elif args.perturbation_score_rule:
+                            csid_ood = raw_perturbation_ood_scores(
+                                csid_cache_variant, score_rule)
+                            csid_scores = score_tuple_from_ood(
+                                csid_cache_variant, csid_ood)
+                        else:
+                            csid_scores = score_tuple(
+                                csid_cache_variant, score_rule)
+                        save_npz(
+                            current_rule_dir / 'scores' / f'{csid_name}.npz',
+                            csid_scores)
+                        csid_score_parts.append(csid_scores)
+                    if args.fsood_id_side == 'both':
+                        metric_id_scores = concat_scores(
+                            [id_scores] + csid_score_parts)
+                    elif args.fsood_id_side == 'csid':
+                        metric_id_scores = concat_scores(csid_score_parts)
+
+                rows = []
+                for split_name, split_caches in [
+                        ('near', near_caches_step),
+                        ('far', far_caches_step),
+                ]:
+                    split_metrics = []
+                    for name, split_cache in split_caches:
+                        split_cache_variant = materialize_branch_variant(
+                            split_cache, accept_choice, reject_choice)
+                        ood_label = -1 * np.ones_like(
+                            split_cache_variant['label'], dtype=np.int64)
+                        if args.vector_score_rule:
+                            split_ood = raw_vector_ood_scores(
+                                split_cache_variant, score_rule, vector_fit)
+                            split_scores = score_tuple_from_ood(
+                                split_cache_variant, split_ood, ood_label)
+                        elif args.perturbation_score_rule:
+                            split_ood = raw_perturbation_ood_scores(
+                                split_cache_variant, score_rule)
+                            split_scores = score_tuple_from_ood(
+                                split_cache_variant, split_ood, ood_label)
+                        else:
+                            split_scores = score_tuple(
+                                split_cache_variant, score_rule, ood_label)
+                        save_npz(
+                            current_rule_dir / 'scores' / f'{name}.npz',
+                            split_scores)
+                        metrics = metric_summary(metric_id_scores, split_scores)
+                        split_metrics.append(metrics)
+                        rows.append(format_metric_row(name, metrics))
+                    if split_metrics:
+                        rows.append(
+                            format_metric_row(
+                                f'{split_name}ood',
+                                np.mean(np.asarray(split_metrics), axis=0)))
+                write_metrics_csv(current_rule_dir / 'ood.csv', rows)
+                rule_manifest = (
+                    vector_manifest if vector_manifest is not None
+                    else dict(step_manifest))
+                if vector_manifest is not None:
+                    write_json(current_rule_dir / 'vector_fit.json',
+                               vector_manifest)
+                if accept_choice is not None:
+                    rule_manifest['selected_accept_branch_id'] = (
+                        accept_choice['id'])
+                if reject_choice is not None:
+                    rule_manifest['selected_reject_branch_id'] = (
+                        reject_choice['id'])
+                rule_manifest['accept_branch_arg'] = args.accept_branch
+                rule_manifest['reject_branch_arg'] = args.reject_branch
+                rule_manifest['branch_combine'] = args.branch_combine
+                write_json(current_rule_dir / 'score_manifest.json',
+                           rule_manifest)
 
     if args.vector_score_rule:
         manifest_name = 'vector_score.json'
-        manifest_data = vector_manifest
     elif args.perturbation_score_rule:
         manifest_name = 'perturbation_score.json'
-        manifest_data = score_manifest
     else:
         manifest_name = 'score.json'
-        manifest_data = score_manifest
     write_json(output_dir / manifest_name,
                manifest_data)
     print(f'output_dir: {output_dir}')
@@ -1622,6 +2140,36 @@ def add_score_command_args(parser):
     parser.add_argument('--score-rule',
                         default='all',
                         choices=SCORE_RULE_CHOICES)
+    parser.add_argument(
+        '--response-step',
+        default='final',
+        help=('Saved response-bank step to score, or "all" to write one '
+              'score result per saved step. Defaults to the final saved '
+              'response step.'),
+    )
+    parser.add_argument(
+        '--accept-branch',
+        default='auto',
+        help=('Acceptance response-bank branch selector for branch scoring: '
+              'auto, all, branch name, branch index, or comma list. Primary '
+              'singleton fields are used automatically when no response bank '
+              'is present.'),
+    )
+    parser.add_argument(
+        '--reject-branch',
+        default='auto',
+        help=('Rejection response-bank branch selector for branch scoring: '
+              'auto, all, branch name, branch index, or comma list. Primary '
+              'singleton fields are used automatically when no response bank '
+              'is present.'),
+    )
+    parser.add_argument(
+        '--branch-combine',
+        default='cross',
+        choices=['cross', 'zip'],
+        help=('How to combine selected accept/reject response-bank branches '
+              'for paired branch scores.'),
+    )
     parser.add_argument(
         '--vector-score-rule',
         choices=VECTOR_SCORE_RULE_CHOICES,

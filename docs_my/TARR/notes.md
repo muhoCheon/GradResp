@@ -16,6 +16,7 @@ Canonical docs:
 - Internal `ood_score` is OOD-like when larger.
 - Stored OpenOOD `conf` is `-ood_score`, so larger `conf` is ID-like.
 - Inline scoring and offline scoring are both Stage 4 and must produce the same `score_result` for the same `tta_response` and score config.
+- Step-wise runs store `response_steps` in `tta_response`; Stage 4 claim rows must record the selected `response_step`.
 - Claim-bearing FSOOD rows require clean-only, csID-only, and clean+csID `score_result` reporting.
 - Soft view-consistency hypothesis: clean ID and csID should remain aligned under controlled target-view response while OOD separates.
 - Runtime claims must report time by artifact stage.
