@@ -408,6 +408,16 @@ def parse_args(argv=None):
                         type=int,
                         default=0,
                         help='Limit OOD loaders. Overrides --max-samples.')
+    parser.add_argument(
+        '--target-shard-count',
+        type=int,
+        default=1,
+        help='Number of modulo shards to split target inference samples into.')
+    parser.add_argument(
+        '--target-shard-index',
+        type=int,
+        default=0,
+        help='Process target samples whose global index modulo count matches this index.')
     parser.add_argument('--batch-size', type=int, default=200)
     parser.add_argument('--reference-set-batch-size', type=int, default=512)
     parser.add_argument(
@@ -453,6 +463,12 @@ def parse_args(argv=None):
         parser.error('--train-candidate-batch-size must be non-negative.')
     if args.tta_response_shard_size < 0:
         parser.error('--tta-response-shard-size must be non-negative.')
+    if args.target_shard_count < 1:
+        parser.error('--target-shard-count must be at least 1.')
+    if args.target_shard_index < 0:
+        parser.error('--target-shard-index must be non-negative.')
+    if args.target_shard_index >= args.target_shard_count:
+        parser.error('--target-shard-index must be less than --target-shard-count.')
     if args.anchor_weight < 0:
         parser.error('--anchor-weight must be non-negative.')
     if args.use_anchor_reference:
@@ -669,6 +685,7 @@ def save_tta_response(path, scores):
     }
     int_keys = {
         'y_hat',
+        'target_global_index',
         'perturbation_response_code',
         'perturbation_kind_code',
         'perturbation_repeats',
@@ -739,6 +756,7 @@ def save_tta_response(path, scores):
 
 
 RESPONSE_CACHE_SCALAR_KEYS = [
+    'target_global_index',
     'y_hat',
     'target_conf',
     'target_entropy',
@@ -805,6 +823,8 @@ RESPONSE_CACHE_ARRAY_KEYS = [
 RESPONSE_CACHE_CONFIG_KEYS = [
     'tta_mode',
     'response_steps',
+    'target_shard_count',
+    'target_shard_index',
     'perturbation_config_id',
     'perturbation_response',
     'perturbation_kind',
@@ -894,6 +914,7 @@ def tta_response_scores_from_lists(cache_lists, pred_array, label_array,
     }
     int_scalar_keys = {
         'y_hat',
+        'target_global_index',
         'perturbation_response_code',
         'perturbation_kind_code',
         'perturbation_repeats',
@@ -923,6 +944,8 @@ def tta_response_scores_from_lists(cache_lists, pred_array, label_array,
         'reference_config_id': reference_config_id,
         'tta_mode': args.tta_mode,
         'response_steps': np.asarray(args.response_steps, dtype=np.int64),
+        'target_shard_count': int(args.target_shard_count),
+        'target_shard_index': int(args.target_shard_index),
         'perturbation_config_id': perturbation_config_id(args),
         'perturbation_response': args.perturbation_response,
         'perturbation_kind': args.perturbation_kind,
@@ -974,6 +997,8 @@ class TTAResponseShardWriter:
                 'expanded_score_rules': selected_score_rules(args.score_rule),
                 'probe_config': probe_config_dict(args),
                 'response_steps': list(args.response_steps),
+                'target_shard_count': int(args.target_shard_count),
+                'target_shard_index': int(args.target_shard_index),
                 'shard_size': self.shard_size,
                 'num_samples': 0,
                 'num_shards': 0,
@@ -1034,6 +1059,8 @@ class TTAResponseShardWriter:
                 'expanded_score_rules': selected_score_rules(self.args.score_rule),
                 'probe_config': probe_config_dict(self.args),
                 'response_steps': list(self.args.response_steps),
+                'target_shard_count': int(self.args.target_shard_count),
+                'target_shard_index': int(self.args.target_shard_index),
                 'shard_size': self.shard_size,
                 'num_samples': int(self.num_samples),
                 'num_shards': len(self.shards),
@@ -1045,6 +1072,8 @@ class TTAResponseShardWriter:
             'manifest': str(self.manifest_path),
             'num_samples': int(self.num_samples),
             'num_shards': len(self.shards),
+            'target_shard_count': int(self.args.target_shard_count),
+            'target_shard_index': int(self.args.target_shard_index),
         }
 
 
@@ -1877,6 +1906,14 @@ def limit_for_split(args, split):
     return args.max_ood_samples or args.max_samples
 
 
+def target_shard_config_dict(args):
+    return {
+        'count': int(args.target_shard_count),
+        'index': int(args.target_shard_index),
+        'rule': 'global_sample_index % count == index',
+    }
+
+
 def protocol_dataset_items(dataset, split, dataset_map, choice):
     if split == 'near':
         expected_names = near_dataset_names(dataset)
@@ -2083,6 +2120,10 @@ class TARRPostprocessor(BasePostprocessor):
             'setup_total_sec': 0.0,
             'inference_total_sec': 0.0,
             'processed_count': 0,
+            'seen_count': 0,
+            'skipped_by_shard_count': 0,
+            'target_shard_count': int(args.target_shard_count),
+            'target_shard_index': int(args.target_shard_index),
             'runtime_per_target_sum_sec': 0.0,
             'runtime_per_target_min_sec': None,
             'runtime_per_target_max_sec': None,
@@ -4131,6 +4172,7 @@ class TARRPostprocessor(BasePostprocessor):
                     for score_rule in self.score_rules
                 },
                 'cache': {
+                    'target_global_index': [],
                     'y_hat': [],
                     'target_conf': [],
                     'target_entropy': [],
@@ -4194,6 +4236,10 @@ class TARRPostprocessor(BasePostprocessor):
             for reference_config_id in self.reference_sets
         }
         processed = 0
+        seen = 0
+        skipped_by_shard = 0
+        shard_count = int(self.args.target_shard_count)
+        shard_index = int(self.args.target_shard_index)
         try:
             iterator = tqdm(
                 data_loader,
@@ -4207,7 +4253,17 @@ class TARRPostprocessor(BasePostprocessor):
                 for idx in range(batch_size):
                     if max_samples > 0 and processed >= max_samples:
                         break
+                    global_sample_index = seen
+                    seen += 1
+                    if global_sample_index % shard_count != shard_index:
+                        skipped_by_shard += 1
+                        continue
+                    debug_start = len(self.sample_debug)
                     pred, per_reference = self.score_one(net, data[idx:idx + 1])
+                    for row in self.sample_debug[debug_start:]:
+                        row['target_global_index'] = int(global_sample_index)
+                        row['target_shard_count'] = shard_count
+                        row['target_shard_index'] = shard_index
                     pred_int = int(pred.detach().cpu().view(-1)[0].item())
                     label_int = int(label[idx].detach().cpu().item())
                     cache_label = (
@@ -4220,6 +4276,7 @@ class TARRPostprocessor(BasePostprocessor):
                         for score_rule, ood_score in ood_scores.items():
                             ref_lists['ood_score'][score_rule].append(
                                 float(ood_score.detach().cpu().view(-1)[0].item()))
+                        cache['target_global_index'] = int(global_sample_index)
                         if streaming_cache:
                             cache_writers[reference_config_id].add(
                                 pred_int, cache_label, cache)
@@ -4240,10 +4297,16 @@ class TARRPostprocessor(BasePostprocessor):
         inference_elapsed = time.perf_counter() - inference_start
         self.timing['inference_total_sec'] += inference_elapsed
         self.timing['processed_count'] += processed
+        self.timing['seen_count'] += seen
+        self.timing['skipped_by_shard_count'] += skipped_by_shard
         self.timing['inference_calls'].append({
             'processed_count': int(processed),
+            'seen_count': int(seen),
+            'skipped_by_shard_count': int(skipped_by_shard),
             'elapsed_sec': inference_elapsed,
             'max_samples': int(max_samples or 0),
+            'target_shard_count': shard_count,
+            'target_shard_index': shard_index,
         })
 
         pred_array = np.asarray(pred_list, dtype=np.int64)
@@ -4262,6 +4325,8 @@ class TARRPostprocessor(BasePostprocessor):
             if streaming_cache:
                 continue
             output_cache = {
+                'target_global_index': np.asarray(
+                    cache_lists['target_global_index'], dtype=np.int64),
                 'y_hat': np.asarray(cache_lists['y_hat'], dtype=np.int64),
                 'target_conf': np.asarray(cache_lists['target_conf'], dtype=np.float64),
                 'target_entropy': np.asarray(cache_lists['target_entropy'], dtype=np.float64),
@@ -4375,6 +4440,8 @@ class TARRPostprocessor(BasePostprocessor):
                 'reference_config_id': reference_config_id,
                 'tta_mode': self.args.tta_mode,
                 'response_steps': np.asarray(self.args.response_steps, dtype=np.int64),
+                'target_shard_count': shard_count,
+                'target_shard_index': shard_index,
                 'perturbation_config_id': perturbation_config_id(self.args),
                 'perturbation_response': self.args.perturbation_response,
                 'perturbation_kind': self.args.perturbation_kind,
@@ -4516,7 +4583,9 @@ def close_tta_response_writers(writers):
 
 def is_full_run_args(args):
     return (args.max_samples == 0 and args.max_id_samples == 0
-            and args.max_ood_samples == 0)
+            and args.max_ood_samples == 0
+            and args.target_shard_count == 1
+            and args.target_shard_index == 0)
 
 
 def require_sharded_tta_response_for_large_full_run(args):
@@ -4642,9 +4711,8 @@ def artifact_identity_dict(args, checkpoint, postprocessor):
         'score_direction': SCORE_DIRECTION,
         'delta_definition': DELTA_DEFINITION,
         'cache_schema_version': CACHE_SCHEMA_VERSION,
-        'is_full_run': (args.max_samples == 0
-                        and args.max_id_samples == 0
-                        and args.max_ood_samples == 0),
+        'target_shard': target_shard_config_dict(args),
+        'is_full_run': is_full_run_args(args),
     }
 
 
@@ -4894,6 +4962,7 @@ def evaluate_scheme(args, evaluator, net, postprocessor, output_dir, scheme,
                 'max_id_samples': args.max_id_samples,
                 'max_ood_samples': args.max_ood_samples,
             },
+            'target_shard': target_shard_config_dict(args),
             'batch_sizes': {
                 'batch_size': args.batch_size,
                 'reference_set_batch_size': args.reference_set_batch_size,
@@ -5009,6 +5078,8 @@ def write_run_info(path, args, checkpoint, postprocessor, elapsed, csid_names):
         f'- max_samples: {args.max_samples}',
         f'- max_id_samples: {args.max_id_samples}',
         f'- max_ood_samples: {args.max_ood_samples}',
+        f'- target_shard_count: {args.target_shard_count}',
+        f'- target_shard_index: {args.target_shard_index}',
         f'- seed: {args.seed}',
         f'- batch_size: {args.batch_size}',
         f'- reference_set_batch_size: {args.reference_set_batch_size}',
@@ -5148,6 +5219,7 @@ def main():
                 'max_id_samples': args.max_id_samples,
                 'max_ood_samples': args.max_ood_samples,
             },
+            'target_shard': target_shard_config_dict(args),
             'batch_sizes': {
                 'batch_size': args.batch_size,
                 'reference_set_batch_size': args.reference_set_batch_size,

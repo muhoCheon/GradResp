@@ -287,7 +287,7 @@ skip    : 의도적으로 건너뜀
 | ImageNet | GradNorm | 1 | 20:03.05 | pass | pass | pass | pass |
 | ImageNet | MDS | 0 | 4:26:17 | pass | pass | pass | pass |
 | ImageNet | RMDS | 1 | 4:22:04 | pass | pass | pass | pass |
-| ImageNet | KNN | - | - | pending | pending | pending | pending |
+| ImageNet | KNN | 0 | 34:18:20 | pass | pass | pass | pass |
 | ImageNet | ViM | 1 | 2:12:46 | pass | pass | pass | pass |
 | ImageNet | Residual | 0 | 29:08.06 | pass | pass | pass | pass |
 | ImageNet | ReAct | 1 | 25:01.34 | pass | pass | pass | pass |
@@ -394,7 +394,7 @@ skip    : 의도적으로 건너뜀
 | ImageNet | GradNorm | 72.95 | - | 90.25 | - | 62.18 | - | 83.01 | - |
 | ImageNet | MDS | 50.42 | - | 67.56 | - | 43.66 | - | 63.08 | - |
 | ImageNet | RMDS | 77.27 | - | 87.16 | - | 61.69 | - | 74.13 | - |
-| ImageNet | KNN | - | - | - | - | - | - | - | - |
+| ImageNet | KNN | 69.39 | 72.61 | 86.24 | 42.89 | 50.70 | 82.79 | 68.16 | 67.11 |
 | ImageNet | ViM | 71.73 | - | 92.00 | - | 51.60 | - | 75.37 | - |
 | ImageNet | Residual | 48.06 | - | 66.40 | - | 42.84 | - | 62.54 | - |
 | ImageNet | ReAct | 77.37 | - | 93.66 | - | 60.46 | - | 82.90 | - |
@@ -501,7 +501,7 @@ skip    : 의도적으로 건너뜀
 | ImageNet | GradNorm | 72.96 | 78.87 | 90.25 | 47.90 | 62.70 | 84.93 | 83.49 | 59.39 |
 | ImageNet | MDS | 55.44 | 85.46 | 74.25 | 62.90 | 46.02 | 91.16 | 67.03 | 73.82 |
 | ImageNet | RMDS | 76.99 | 65.04 | 86.38 | 40.90 | 62.06 | 78.68 | 73.29 | 61.59 |
-| ImageNet | KNN | - | - | - | - | - | - | - | - |
+| ImageNet | KNN | 71.10 | 70.87 | 90.18 | 34.13 | 51.82 | 82.64 | 76.02 | 56.70 |
 | ImageNet | ViM | 72.08 | 71.35 | 92.68 | 24.66 | 52.50 | 83.35 | 80.10 | 48.81 |
 | ImageNet | Residual | 48.06 | 93.77 | 66.39 | 75.68 | 42.70 | 96.01 | 62.34 | 81.11 |
 | ImageNet | ReAct | 77.38 | 66.74 | 93.67 | 26.31 | 59.93 | 79.97 | 82.78 | 50.00 |

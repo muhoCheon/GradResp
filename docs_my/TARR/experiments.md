@@ -858,3 +858,440 @@ final score:
   simple combination of semantic branch and far-shift branch after the new
   response field is validated
 ```
+
+## Fresh A/R Response-Bank Runtime Check
+
+Date: 2026-06-04.
+
+Goal:
+
+Run the new `target_objective_delta` response-bank schema from Stage 3 on
+ImageNet-200 and CIFAR-100, then compare broad Stage 4 `probe_all` scores
+against Group 1 post-hoc baselines.
+
+Attempted focused full commands:
+
+```text
+ImageNet-200:
+  reference = correct_rpc32
+  accept bank = predicted_label_ce, entropy_min, view_consistency
+  reject bank = entropy_max, uniform
+  steps/save_steps = 30 / 5,10,30
+  lr = 1e-2
+
+CIFAR-100:
+  reference = correct_rpc32
+  accept bank = predicted_label_ce, entropy_min, view_consistency
+  reject bank = entropy_max, uniform
+  steps/save_steps = 30 / 5,10,30
+  lr = 1e-2
+```
+
+Both commands used `--perturbation-response pixel --perturbation-kind gaussian
+--perturbation-eps 0.01 --perturbation-repeats 4` because
+`view_consistency` requires perturbation views.
+
+Result:
+
+The runs were intentionally interrupted before completion. They were not used
+for AUROC comparison.
+
+Observed runtime issue:
+
+```text
+single-process full FSOOD run:
+  low GPU memory use
+  low GPU utilization
+  very long target-loop wall time
+```
+
+The CIFAR-100 run completed several FSOOD loaders but then entered a large
+137-batch split, making the focused run several hours long. The ImageNet-200
+run entered a 469-batch split and was also projected to take hours.
+
+Decision:
+
+Do not use single-process full FSOOD `eval.py run-response` as the default
+execution path for the semantic response bank. Before claim-bearing full
+coverage runs, use a small max-sample precheck to validate schema/scoring, then
+run full coverage through a parallel runner or target-sharded execution path.
+
+This is a runtime finding only. It does not change the scientific scoring
+decision.
+
+Completed precheck:
+
+```text
+ImageNet-200:
+  run_id = imagenet200_eval_api_fsood_arbank_semantic_precheck_s5_lr1e2_correct_rpc32_refseed0
+  reference = correct_rpc32
+  max_id_samples = 8
+  max_ood_samples = 8
+  response_steps = [5]
+  accept_ref_loss_delta_bank shape = [8,1,3,200]
+  reject_ref_loss_delta_bank shape = [8,1,2,200]
+  score_results/ood.csv count after probe_all both/clean/csid = 395
+
+CIFAR-100:
+  run_id = cifar100_eval_api_fsood_arbank_semantic_precheck_s5_lr1e2_correct_rpc32_refseed0
+  reference = correct_rpc32
+  max_id_samples = 8
+  max_ood_samples = 8
+  response_steps = [5]
+  accept_ref_loss_delta_bank shape = [8,1,3,100]
+  reject_ref_loss_delta_bank shape = [8,1,2,100]
+  score_results/ood.csv count after probe_all both/clean/csid = 395
+```
+
+Precheck decision:
+
+The new response-bank schema and Stage 4 `probe_all` expansion work on both
+ImageNet-200 and CIFAR-100. The remaining blocker is not correctness but
+runtime: full target coverage needs a parallel execution plan before it is
+reasonable to run the full SOTA comparison.
+
+Target-shard execution path:
+
+Implemented target-shard support in `scripts_my/tarr/eval.py` and merge support
+in `scripts_my/tarr/merge_tta_response_shards.py`.
+
+New Stage 3 options:
+
+```text
+--target-shard-count <N>
+--target-shard-index <i>
+```
+
+Shard rule:
+
+```text
+global_sample_index % target_shard_count == target_shard_index
+```
+
+After all shards finish, merge them:
+
+```bash
+python scripts_my/tarr/merge_tta_response_shards.py \
+  --dataset cifar100 \
+  --scheme fsood \
+  --reference-config-id correct_rpc32 \
+  --output-run-dir <merged_run_dir> \
+  --input-run-dir <shard0_run_dir> \
+  --input-run-dir <shard1_run_dir> \
+  --overwrite
+```
+
+Then run normal validation and scoring on the merged run:
+
+```bash
+python scripts_my/tarr/cache.py validate \
+  --run-dir <merged_run_dir> \
+  --scheme fsood \
+  --reference-config-id correct_rpc32 \
+  --expect-dataset cifar100
+
+python scripts_my/tarr/cache.py score \
+  --run-dir <merged_run_dir> \
+  --scheme fsood \
+  --reference-config-id correct_rpc32 \
+  --dataset cifar100 \
+  --fsood-id-side both \
+  --response-step all \
+  --score-rule probe_all \
+  --overwrite
+```
+
+Completed 2-shard merge smoke:
+
+```text
+Dataset = CIFAR-100
+Reference = correct_rpc32
+Shard count = 2
+Per-shard sample limit = max_id_samples=4, max_ood_samples=4
+Merged run = cifar100_eval_api_fsood_arbank_semantic_shardtest_s5_lr1e2_correct_rpc32_refseed0_merged2
+
+cache.py validate:
+  OK 8 TTA response dataset(s)
+
+Merged ID response shape:
+  accept_ref_loss_delta_bank = [8,1,3,100]
+  reject_ref_loss_delta_bank = [8,1,2,100]
+  accept_target_objective_delta_bank = [8,1,3]
+  reject_target_objective_delta_bank = [8,1,2]
+  reject_target_entropy_delta_bank = [8,1,2]
+  target_shard_index = -1
+  target_shard_count = 2
+
+Stage 4:
+  probe_all both/clean/csid succeeded
+  score_manifest count = 360
+  ood.csv count = 360
+```
+
+Operational runner:
+
+```bash
+scripts_my/runners/tarr_ar_bank_sharded_focused.sh \
+  imagenet200 \
+  correct_rpc32 \
+  "per_class=32,filter=correct,seed=0" \
+  8
+```
+
+## Fresh A/R Response-Bank Full Focused Results
+
+Date: 2026-06-05.
+
+`both avg` is the simple mean of FSOOD `nearood` AUROC and `farood` AUROC.
+Group 1 gap is measured against the best post-hoc Group 1 baseline for the
+same dataset and `both avg` definition. A focused result above Group 1 is a
+candidate for reference-grid and refseed follow-up, not a final SOTA claim.
+
+Execution log:
+
+| Date | Dataset | Reference | Run | Stage 3 | Stage 4 | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-06-05 | CIFAR-100 | `correct_rpc32` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correct_rpc32_refseed0_merged8` | 8 target shards, fresh response bank | `probe_all`, `both/clean/csid` | complete |
+| 2026-06-05 | CIFAR-100 | `all_rpc8` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_all_rpc8_refseed0_merged8` | 8 target shards, fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-05 | CIFAR-100 | `all_rpc16` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_all_rpc16_refseed0_merged8` | 8 target shards, fresh response bank | `probe_all`, `both/clean/csid` | complete |
+| 2026-06-05 | CIFAR-100 | `correct_rpc8` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correct_rpc8_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `all_rpc32` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_all_rpc32_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `correct_rpc16` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correct_rpc16_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `highconf09_rpc8` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_highconf09_rpc8_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `highconf09_rpc16` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_highconf09_rpc16_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `highconf09_rpc32` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_highconf09_rpc32_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `correcthigh09_rpc8` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correcthigh09_rpc8_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `correcthigh09_rpc16` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correcthigh09_rpc16_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `correcthigh09_rpc32` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correcthigh09_rpc32_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `strat_rpc8` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_strat_rpc8_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `strat_rpc16` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_strat_rpc16_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-06 | CIFAR-100 | `strat_rpc32` | `cifar100_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_strat_rpc32_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-05 | ImageNet-200 | `correct_rpc32` | `imagenet200_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correct_rpc32_refseed0_merged8` | 8 target shards, fresh response bank | `probe_all`, `both/clean/csid` | complete |
+| 2026-06-05 | ImageNet-200 | `correcthigh09_rpc16` | `imagenet200_eval_api_fsood_arbank_semantic_s30_5x10x30_lr1em2_correcthigh09_rpc16_refseed0_minbank_pce_uniform_merged8` | 8 target shards, reduced fresh response bank | `probe_all`, `both/clean/csid` | complete reference follow-up |
+| 2026-06-05 | ImageNet-200 | `correcthigh09_rpc16` | earlier broad-bank attempts | failed/partial Stage 3 | not scored | superseded by reduced-bank merged8 run |
+
+Group 1 comparison:
+
+| Dataset | Reference | ID side | Score | Step | Accept | Reject | Near | Far | Both avg | Group 1 best | Gap | Decision |
+| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| CIFAR-100 | `correct_rpc32` | both | `accept_abs_ref_efficiency` | 5 | `entropy_min` | - | 63.37 | 65.89 | 64.63 | RMDS 66.20 | -1.57 | improves old default, below Group 1 best |
+| CIFAR-100 | `all_rpc16` | both | `reject_efficiency` | 30 | - | `uniform` | 63.76 | 69.81 | 66.78 | RMDS 66.20 | +0.58 | first fresh claim-compatible focused run above Group 1 best |
+| CIFAR-100 | `correct_rpc8` | both | `accept_abs_ref_efficiency` | 10 | `predicted_label_ce` | - | 65.63 | 65.23 | 65.43 | RMDS 66.20 | -0.77 | reduced-bank reference follow-up; below `all_rpc16` |
+| ImageNet-200 | `correct_rpc32` | both | `accept_efficiency` | 5 | `predicted_label_ce` | - | 63.16 | 74.68 | 68.92 | SCALE 65.545 | +3.38 | strong focused result above Group 1 best |
+| ImageNet-200 | `correcthigh09_rpc16` | both | `accept_efficiency` | 5 | `predicted_label_ce` | - | 58.22 | 70.01 | 64.12 | SCALE 65.545 | -1.43 | reduced-bank far-biased reference follow-up; below `correct_rpc32` and Group 1 |
+
+CIFAR-100 `all_rpc16` is the current focused candidate. The margin over RMDS is
+modest, so the result needs reference-grid and refseed robustness before it can
+support a final claim.
+
+ImageNet-200 `correct_rpc32` is the current strongest fresh focused result. The
+best score is accept-only rather than paired A/R: `accept_efficiency` with
+`predicted_label_ce` at response step 5. This should be followed by
+reference-grid and refseed robustness, while separately analyzing why paired
+`ar_efficiency_contrast` is much weaker.
+
+Reference follow-up status:
+
+The focused result is not a sufficient stopping point. CIFAR-100 15-reference
+follow-up is now complete. Additional references were run with the reduced bank
+needed by the focused best score families. Completed fresh references are:
+
+| Dataset | Reference | Best FSOOD score | Step | Branch | Near | Far | Both avg | Group 1 best | Gap | Status |
+| --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- | ---: | --- |
+| CIFAR-100 | `all_rpc8` | `target_weighted_ref_loss_delta_contrast` | 30 | accept=`predicted_label_ce`, reject=`uniform` | 64.35 | 64.62 | 64.49 | RMDS 66.20 | -1.72 | below `all_rpc16` |
+| CIFAR-100 | `all_rpc16` | `reject_efficiency` | 30 | reject=`uniform` | 63.76 | 69.81 | 66.78 | RMDS 66.20 | +0.58 | current CIFAR-100 reference follow-up best |
+| CIFAR-100 | `all_rpc32` | `accept_abs_ref_efficiency` | 10 | accept=`predicted_label_ce` | 64.34 | 65.43 | 64.89 | RMDS 66.20 | -1.31 | below `all_rpc16`; weaker than `correct_rpc16` |
+| CIFAR-100 | `correct_rpc8` | `accept_abs_ref_efficiency` | 10 | accept=`predicted_label_ce` | 65.63 | 65.23 | 65.43 | RMDS 66.20 | -0.77 | below `all_rpc16`; better than `all_rpc8`/`correct_rpc32` |
+| CIFAR-100 | `correct_rpc16` | `reject_efficiency` | 30 | reject=`uniform` | 62.95 | 69.61 | 66.28 | RMDS 66.20 | +0.08 | valid follow-up; only marginally above Group 1 and below `all_rpc16` |
+| CIFAR-100 | `correct_rpc32` | `accept_abs_ref_efficiency` | 5 | accept=`entropy_min` | 63.37 | 65.89 | 64.63 | RMDS 66.20 | -1.57 | below Group 1 |
+| CIFAR-100 | `highconf09_rpc8` | `accept_abs_ref_efficiency` | 30 | accept=`predicted_label_ce` | 65.17 | 65.54 | 65.36 | RMDS 66.20 | -0.84 | below `all_rpc16` and Group 1 |
+| CIFAR-100 | `highconf09_rpc16` | `accept_efficiency` | 10 | accept=`predicted_label_ce` | 64.44 | 67.58 | 66.01 | RMDS 66.20 | -0.19 | improves over `highconf09_rpc8`, but remains below `all_rpc16` and Group 1 |
+| CIFAR-100 | `highconf09_rpc32` | `reject_efficiency` | 30 | reject=`uniform` | 64.16 | 65.59 | 64.88 | RMDS 66.20 | -1.32 | below `highconf09_rpc16`, `all_rpc16`, and Group 1 |
+| CIFAR-100 | `correcthigh09_rpc8` | `accept_abs_ref_efficiency` | 30 | accept=`predicted_label_ce` | 65.17 | 65.54 | 65.36 | RMDS 66.20 | -0.84 | below `all_rpc16` and Group 1 |
+| CIFAR-100 | `correcthigh09_rpc16` | `accept_efficiency` | 10 | accept=`predicted_label_ce` | 64.44 | 67.58 | 66.01 | RMDS 66.20 | -0.19 | matches `highconf09_rpc16`; below `all_rpc16` and Group 1 |
+| CIFAR-100 | `correcthigh09_rpc32` | `reject_efficiency` | 30 | reject=`uniform` | 64.16 | 65.59 | 64.88 | RMDS 66.20 | -1.32 | matches `highconf09_rpc32`; below `all_rpc16` and Group 1 |
+| CIFAR-100 | `strat_rpc8` | `reject_efficiency` | 30 | reject=`uniform` | 63.39 | 70.02 | 66.70 | RMDS 66.20 | +0.50 | above Group 1 but below `all_rpc16` |
+| CIFAR-100 | `strat_rpc16` | `reject_efficiency` | 30 | reject=`uniform` | 64.41 | 66.09 | 65.25 | RMDS 66.20 | -0.95 | below `all_rpc16` and Group 1 |
+| CIFAR-100 | `strat_rpc32` | `reject_efficiency` | 30 | reject=`uniform` | 64.89 | 64.34 | 64.62 | RMDS 66.20 | -1.58 | below `all_rpc16` and Group 1 |
+| ImageNet-200 | `correct_rpc32` | `accept_efficiency` | 5 | accept=`predicted_label_ce` | 63.16 | 74.68 | 68.92 | SCALE 65.545 | +3.38 | current ImageNet-200 focused/reference seed 0 best |
+| ImageNet-200 | `correcthigh09_rpc16` | `accept_efficiency` | 5 | accept=`predicted_label_ce` | 58.22 | 70.01 | 64.12 | SCALE 65.545 | -1.43 | far-biased reference did not improve the fresh reduced-bank result |
+
+Clean-only OOD diagnostic for the same completed references:
+
+| Dataset | Reference | Best clean-only score | Step | Branch | Near | Far | Avg | Group 1 clean avg | Gap |
+| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| CIFAR-100 | `all_rpc8` | `target_weighted_ref_loss_delta_contrast` | 30 | accept=`view_consistency`, reject=`uniform` | 80.85 | 80.70 | 80.78 | 81.535 | -0.76 |
+| CIFAR-100 | `all_rpc16` | `target_weighted_ref_loss_delta_contrast` | 30 | accept=`view_consistency`, reject=`uniform` | 81.11 | 81.70 | 81.41 | 81.535 | -0.13 |
+| CIFAR-100 | `all_rpc32` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.17 | 80.22 | 80.69 | 81.535 | -0.85 |
+| CIFAR-100 | `correct_rpc8` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 80.93 | 80.70 | 80.81 | 81.535 | -0.72 |
+| CIFAR-100 | `correct_rpc16` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.18 | 81.81 | 81.50 | 81.535 | -0.04 |
+| CIFAR-100 | `correct_rpc32` | `target_weighted_ref_loss_delta_contrast` | 30 | accept=`view_consistency`, reject=`uniform` | 81.20 | 80.14 | 80.67 | 81.535 | -0.87 |
+| CIFAR-100 | `highconf09_rpc8` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.23 | 79.50 | 80.37 | 81.535 | -1.17 |
+| CIFAR-100 | `highconf09_rpc16` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.22 | 80.68 | 80.95 | 81.535 | -0.59 |
+| CIFAR-100 | `highconf09_rpc32` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.40 | 80.61 | 81.00 | 81.535 | -0.54 |
+| CIFAR-100 | `correcthigh09_rpc8` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.23 | 79.50 | 80.37 | 81.535 | -1.17 |
+| CIFAR-100 | `correcthigh09_rpc16` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.22 | 80.68 | 80.95 | 81.535 | -0.59 |
+| CIFAR-100 | `correcthigh09_rpc32` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.40 | 80.61 | 81.00 | 81.535 | -0.54 |
+| CIFAR-100 | `strat_rpc8` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.07 | 81.59 | 81.33 | 81.535 | -0.21 |
+| CIFAR-100 | `strat_rpc16` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.24 | 80.45 | 80.84 | 81.535 | -0.70 |
+| CIFAR-100 | `strat_rpc32` | `reject_pos_ref_loss_delta_ood` | 30 | reject=`uniform` | 81.36 | 80.07 | 80.72 | 81.535 | -0.82 |
+| ImageNet-200 | `correct_rpc32` | `target_weighted_ref_loss_delta_contrast` | 10 | accept=`view_consistency`, reject=`uniform` | 84.91 | 91.84 | 88.38 | 89.41 | -1.03 |
+| ImageNet-200 | `correcthigh09_rpc16` | `reject_pos_ref_loss_delta_ood` | 10 | reject=`uniform` | 83.99 | 92.47 | 88.23 | 89.41 | -1.18 |
+
+Do not treat the older interrupted CIFAR-100 `all_rpc32` shard-only attempt or
+the earlier failed/partial broad-bank ImageNet-200 `correcthigh09_rpc16`
+attempts as valid results. The valid CIFAR-100 `all_rpc32` reduced-bank
+merged8 run is now complete, and it is below `all_rpc16`. The valid
+CIFAR-100 `highconf09_rpc16` reduced-bank merged8 run is also complete; it
+improves over `highconf09_rpc8`, but remains below `all_rpc16` and Group 1. The valid
+CIFAR-100 `highconf09_rpc32` reduced-bank merged8 run is complete; it drops below
+`highconf09_rpc16` and remains below `all_rpc16` and Group 1. The valid
+CIFAR-100 `correcthigh09_rpc8` reduced-bank merged8 run is complete and remains
+below `all_rpc16` and Group 1. The valid
+CIFAR-100 `correcthigh09_rpc16` reduced-bank merged8 run is complete; it matches
+`highconf09_rpc16` and remains below `all_rpc16` and Group 1. The valid
+CIFAR-100 `correcthigh09_rpc32` reduced-bank merged8 run is complete; it matches
+`highconf09_rpc32` and remains below `all_rpc16` and Group 1. The valid
+CIFAR-100 `strat_rpc8` reduced-bank merged8 run is complete; it exceeds Group 1
+but remains below `all_rpc16`. The valid CIFAR-100 `strat_rpc16` and
+`strat_rpc32` reduced-bank merged8 runs are complete and remain below
+`all_rpc16` and Group 1. The valid
+ImageNet-200 `correcthigh09_rpc16` reduced-bank run is also complete and is
+below `correct_rpc32`.
+
+Runtime correction:
+
+The original broad response-bank setup
+`accept=predicted_label_ce,entropy_min,view_consistency` and
+`reject=entropy_max,uniform` is useful for focused discovery, but it is too
+expensive for a full reference grid. On 2026-06-05, attached retries showed:
+
+```text
+ImageNet-200 correcthigh09_rpc16:
+  broad bank on GPU1 was too slow for reference follow-up and was superseded.
+  The valid reduced-bank merged8 follow-up later completed and scored.
+  Its best FSOOD both avg is 64.12, below correct_rpc32 and below SCALE 65.545.
+
+CIFAR-100 correct_rpc8:
+  broad bank was slow, so the valid follow-up used the reduced bank
+  accept=predicted_label_ce, reject=uniform.
+  The reduced-bank merged8 run completed and scored successfully.
+```
+
+Therefore reference-grid follow-up should use score-specific reduced banks, not
+the full discovery bank:
+
+```bash
+# For the current CIFAR-100 reject-efficiency candidate:
+RUN_SUFFIX=minbank_pce_uniform \
+ACCEPT_PROBE_TYPES=predicted_label_ce \
+REJECT_PROBE_TYPES=uniform \
+scripts_my/runners/tarr_ar_bank_sharded_focused.sh \
+  cifar100 <ref_id> "<ref_spec>" 8
+
+# For the current ImageNet-200 accept-efficiency candidate:
+RUN_SUFFIX=minbank_pce_uniform \
+ACCEPT_PROBE_TYPES=predicted_label_ce \
+REJECT_PROBE_TYPES=uniform \
+scripts_my/runners/tarr_ar_bank_sharded_focused.sh \
+  imagenet200 <ref_id> "<ref_spec>" 8
+```
+
+When using the 15-reference wrapper, skip the slow full-tree collector during
+the experiment run and rank the finished merged run directories separately:
+
+```bash
+RUN_SUFFIX=minbank_pce_uniform \
+ACCEPT_PROBE_TYPES=predicted_label_ce \
+REJECT_PROBE_TYPES=uniform \
+SKIP_COLLECT_SCORE=1 \
+scripts_my/runners/tarr_ar_bank_sharded_refgrid.sh \
+  cifar100 8
+```
+
+This preserves the branch needed by the current best scores
+(`accept_efficiency` with `predicted_label_ce` and `reject_efficiency` with
+`uniform`) while avoiding unnecessary Stage 3 updates for branches that are not
+being grid-expanded.
+
+Post-hoc ordering/sign-combination sweep:
+
+```bash
+python scripts_my/tarr/analyze_probe_ordering.py \
+  --output results_test/tarr/summary/tarr_probe_ordering_grid.csv \
+  --top-k 15
+```
+
+This is a Stage 4-only diagnostic sweep over saved score artifacts. It evaluates
+single-score sign flips and accept/reject pair combinations:
+
+```text
++score, -score
++A+R, +A-R, -A+R, -A-R
+max/min over all (+/-A, +/-R) sign pairs
+```
+
+Output:
+
+```text
+results_test/tarr/summary/tarr_probe_ordering_grid.csv
+```
+
+The sweep uses global FSOOD score leaves and excludes `id_side_clean` /
+`id_side_csid` score leaves. Near/far group AUROC is sample-weighted after
+concatenating all datasets in the group, not dataset-balanced.
+
+The clean CSV contains `9210` candidates:
+
+```text
+ImageNet-200 correct_rpc32:                  2880
+ImageNet-200 correcthigh09_rpc16 minbank:     570
+CIFAR-100 all_rpc16:                         2880
+CIFAR-100 correct_rpc32:                     2880
+```
+
+Main ordering results:
+
+| Dataset | Reference | Candidate | Step | Accept | Reject | clean/csID | csID/near | near/far | ordering min | Both avg | Group 1 gap |
+| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ImageNet-200 | `correct_rpc32` | `ref_abs:-A-R` | 30 | `predicted_label_ce` | `uniform` | 70.79 | 60.79 | 59.00 | 59.00 | 68.87 | +3.33 |
+| ImageNet-200 | `correcthigh09_rpc16` | `reject_efficiency` | 30 | - | `uniform` | 46.47 | 56.78 | 54.84 | 46.47 | 62.70 | -2.85 |
+| CIFAR-100 | `all_rpc16` | `accept_abs_ref_loss_delta_mean` | 30 | `view_consistency` | - | 64.86 | 56.11 | 55.75 | 55.75 | 64.23 | -1.97 |
+| CIFAR-100 | `correct_rpc32` | `ref_signed:+A+R` | 30 | `predicted_label_ce` | `entropy_max` | 55.11 | 54.33 | 54.48 | 54.33 | 57.58 | -8.62 |
+
+Main FSOOD results from the same sweep:
+
+| Dataset | Reference | Candidate | Step | Accept | Reject | clean/csID | csID/near | near/far | ordering min | Both avg | Group 1 gap |
+| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ImageNet-200 | `correct_rpc32` | `ref_abs:-A-R` | 10 | `predicted_label_ce` | `uniform` | 72.91 | 61.47 | 57.33 | 57.33 | 69.27 | +3.73 |
+| ImageNet-200 | `correcthigh09_rpc16` | `eff_abs:+A+R` | 10 | `predicted_label_ce` | `uniform` | 44.92 | 53.67 | 56.23 | 44.92 | 64.70 | -0.84 |
+| CIFAR-100 | `all_rpc16` | `-reject_signed_ref_loss_delta_mean` | 5 | - | `uniform` | 77.85 | 50.80 | 57.77 | 50.80 | 66.91 | +0.71 |
+| CIFAR-100 | `correct_rpc32` | `target_objective:+A+R` | 10 | `entropy_min` | `uniform` | 72.61 | 54.96 | 51.24 | 51.24 | 65.21 | -0.99 |
+
+Interpretation:
+
+- No candidate in the four fresh score sets reaches pairwise AUROC `>=60` for all
+  three boundaries `clean/csID`, `csID/near`, and `near/far`.
+- ImageNet-200 has useful post-hoc combinations above Group 1. The best one is
+  closer to a reference-stability score than a semantic A/R efficiency score.
+- ImageNet-200 `correcthigh09_rpc16` does not improve the fresh `correct_rpc32`
+  result. Even the best post-hoc FSOOD candidate remains below Group 1.
+- CIFAR-100 `all_rpc16` can slightly exceed Group 1 in FSOOD both avg, but
+  csID/near remains nearly random. This is the main remaining weakness for the
+  intended four-way ordering.
+
+Clean/csID diagnostics:
+
+| Dataset | Reference | ID side | Score | Step | Accept | Reject | Near | Far | Avg |
+| --- | --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: |
+| CIFAR-100 | `correct_rpc32` | clean | `target_weighted_ref_loss_delta_contrast` | 30 | `view_consistency` | `uniform` | 81.20 | 80.14 | 80.67 |
+| CIFAR-100 | `correct_rpc32` | csid | `accept_pos_ref_loss_delta_mean` | 30 | `view_consistency` | - | 57.24 | 55.06 | 56.15 |
+| CIFAR-100 | `all_rpc16` | clean | `target_weighted_ref_loss_delta_contrast` | 30 | `view_consistency` | `uniform` | 81.11 | 81.70 | 81.41 |
+| CIFAR-100 | `all_rpc16` | csid | `reject_efficiency` | 5 | - | `uniform` | 53.87 | 62.56 | 58.22 |
+| ImageNet-200 | `correct_rpc32` | clean | `target_weighted_ref_loss_delta_contrast` | 10 | `view_consistency` | `uniform` | 84.91 | 91.84 | 88.38 |
+| ImageNet-200 | `correct_rpc32` | csid | `accept_efficiency` | 5 | `entropy_min` | - | 59.05 | 69.38 | 64.22 |
+
+This runner executes shard-specific Stage 3 jobs, merges their `tta_response`
+artifacts, validates the merged cache, and runs `probe_all` for FSOOD
+`both/clean/csid`. Use it as the default entrypoint for the next fresh
+ImageNet-200 and CIFAR-100 focused runs.
