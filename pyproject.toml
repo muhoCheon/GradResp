@@ -52,7 +52,6 @@ addopts = [
     "--strict-markers",
     "--cov=openood",
     "--cov-report=term-missing",
-    "--cov-report=html",
     "--cov-report=xml",
     "--cov-fail-under=0",  # TODO: Set to 80 once tests are written
 ]
@@ -92,9 +91,6 @@ exclude_lines = [
 precision = 2
 show_missing = true
 skip_covered = false
-
-[tool.coverage.html]
-directory = "htmlcov"
 
 [tool.coverage.xml]
 output = "coverage.xml"
